@@ -1,0 +1,6 @@
+<Project>
+  <PropertyGroup>
+    <IncludePath>C:\WDK\Include\10.0.22621.0\km;C:\WDK\Include\10.0.22621.0\shared;C:\WDK\Include\10.0.22621.0\um;C:\WDK\Include\10.0.22621.0\ucrt;$(IncludePath)</IncludePath>
+    <LibraryPath>C:\WDK\Lib\10.0.22621.0\km\x64;C:\WDK\Lib\10.0.22621.0\um\x64;$(LibraryPath)</LibraryPath>
+  </PropertyGroup>
+</Project>
