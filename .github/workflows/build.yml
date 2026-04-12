@@ -29,6 +29,9 @@ jobs:
           # Force the path into the environment for this session
           echo "C:\WDK\Include\10.0.22621.0\km" >> $env:GITHUB_PATH
 
+      - name: Verify WDK Files
+        run: dir C:\WDK\Include\10.0.22621.0\km\ntddk.h
+
       - name: Build Driver (Release x64)
         shell: cmd
         env:
