@@ -31,10 +31,12 @@ jobs:
 
       - name: Build Driver (Release x64)
         shell: cmd
+        env:
+          # This forces the compiler to look in the WDK folders we installed
+          INCLUDE: C:\WDK\Include\10.0.22621.0\km;C:\WDK\Include\10.0.22621.0\shared;C:\WDK\Include\10.0.22621.0\um;%INCLUDE%
+          LIB: C:\WDK\Lib\10.0.22621.0\km\x64;%LIB%
         run: |
           msbuild UsbAsRam.vcxproj ^
             /p:Configuration=Release ^
             /p:Platform=x64 ^
-            /p:SpectreMitigation=false ^
-            /p:IncludePath="C:\WDK\Include\10.0.22621.0\km;C:\WDK\Include\10.0.22621.0\shared;C:\WDK\Include\10.0.22621.0\um;%IncludePath%" ^
-            /p:LibraryPath="C:\WDK\Lib\10.0.22621.0\km\x64;%LibraryPath%"
+            /p:SpectreMitigation=false
