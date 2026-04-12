@@ -12,6 +12,4 @@ jobs:
         uses: microsoft/setup-msbuild@v2
 
       - name: Build Driver
-        shell: cmd
-        run: |
-          msbuild UsbAsRam.vcxproj /p:Configuration=Release /p:Platform=x64 /p:SpectreMitigation=false
+        run: msbuild UsbAsRam.vcxproj /p:Configuration=Release /p:Platform=x64 /p:SpectreMitigation=false
