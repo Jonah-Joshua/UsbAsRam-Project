@@ -1,6 +1,10 @@
 name: Driver Build Workflow
 on: [push, workflow_dispatch]
 
+env:
+  # Opt into Node.js 24 to resolve deprecation warnings
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build:
     runs-on: windows-latest
@@ -14,7 +18,7 @@ jobs:
       - name: Install WDK
         shell: pwsh
         run: |
-          # Define the WDK installer URL (matching 22621 version)
+          # Define the WDK installer URL (Targeting Windows 11/10 SDK 22621)
           $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2196230"
           $wdkPath = "$env:TEMP\wdksetup.exe"
           
@@ -22,16 +26,22 @@ jobs:
           Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkPath
           
           Write-Host "Installing WDK... (This may take 2-5 minutes)"
+          # Quiet installation prevents the UI from hanging the runner
           Start-Process -FilePath $wdkPath -ArgumentList "/quiet", "/norestart", "/ceip off" -Wait
           Write-Host "WDK Installation complete."
 
       - name: Build Driver (Release x64)
-        run: msbuild UsbAsRam.vcxproj /p:Configuration=Release /p:Platform=x64 /p:SpectreMitigation=Spectre
+        # Using the updated flags and ensuring MSBuild sees the WDK headers
+        run: |
+          msbuild UsbAsRam.vcxproj `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:SpectreMitigation=Spectre `
+            /p:TargetVersion=Windows10
 
       - name: Save the Polished Output
         uses: actions/upload-artifact@v4
         with:
           name: UsbAsRam-Binary
-          # Note: MSBuild usually outputs to x64/Release/ or UsbAsRam/x64/Release/
-          # Check your build logs if the path is slightly different
+          # Verify this path matches your project structure
           path: x64/Release/
