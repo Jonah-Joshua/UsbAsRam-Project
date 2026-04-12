@@ -2,11 +2,11 @@ name: Driver Build Workflow
 on: [push, workflow_dispatch]
 
 env:
-  # This suppresses the Node.js 20 deprecation warnings and forces Node 24
+  # This tells GitHub to run Node 20 actions on Node 24 without throwing a fit
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  build_driver:
+  build:
     runs-on: windows-latest
     steps:
       - name: Checkout Code
@@ -15,19 +15,20 @@ jobs:
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
-      - name: Install Windows Driver Kit (WDK)
+      - name: Install WDK
         shell: pwsh
         run: |
           $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2196230"
           $wdkPath = "$env:TEMP\wdksetup.exe"
           Write-Host "Downloading WDK..."
           Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkPath
-          Write-Host "Installing WDK Headers and Libs..."
-          # The /features + flag is the secret sauce to ensure ntddk.h is installed
+          
+          Write-Host "Installing WDK (Headers & Libs)..."
+          # Adding /features + ensures the actual headers are installed
           Start-Process -FilePath $wdkPath -ArgumentList "/quiet", "/norestart", "/features +", "/ceip off" -Wait
           Write-Host "WDK Installation complete."
 
-      - name: Build UsbAsRam
+      - name: Build Driver (Release x64)
         shell: cmd
         run: |
           msbuild UsbAsRam.vcxproj ^
@@ -37,11 +38,12 @@ jobs:
             /p:WindowsTargetPlatformVersion=10.0 ^
             /p:TargetVersion=Windows10
 
-      - name: Upload Driver Artifact
+      - name: Save Driver Output
         uses: actions/upload-artifact@v4
         with:
-          name: UsbAsRam-Driver-Package
+          name: UsbAsRam-Binary
+          # This finds the .sys file wherever MSBuild decided to put it
           path: |
             **/Release/*.sys
             **/Release/*.inf
-            **/Release/*.pdb
+            **/Release/*.cer
