@@ -14,32 +14,34 @@ jobs:
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
-      - name: Install WDK (Headers and Libs)
+      - name: Install WDK to C:\WDK
         shell: pwsh
         run: |
-          # Use a direct link to the 22621 WDK (Windows 11, version 22H2)
           $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2196230"
           $wdkPath = "$env:TEMP\wdksetup.exe"
           Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkPath
-          
-          Write-Host "Installing WDK... this usually takes 3-4 minutes."
-          # Adding /installpath ensures we know where it goes, /features + ensures headers
+          Write-Host "Installing WDK... This will take a few minutes."
           Start-Process -FilePath $wdkPath -ArgumentList "/quiet", "/installpath C:\WDK", "/features +", "/ceip off" -Wait
-          
-          # Force the path into the environment for this session
-          echo "C:\WDK\Include\10.0.22621.0\km" >> $env:GITHUB_PATH
 
-      - name: Verify WDK Files
-        run: dir C:\WDK\Include\10.0.22621.0\km\ntddk.h
-
-      - name: Build Driver (Release x64)
-        shell: cmd
-        env:
-          # This forces the compiler to look in the WDK folders we installed
-          INCLUDE: C:\WDK\Include\10.0.22621.0\km;C:\WDK\Include\10.0.22621.0\shared;C:\WDK\Include\10.0.22621.0\um;%INCLUDE%
-          LIB: C:\WDK\Lib\10.0.22621.0\km\x64;%LIB%
+      - name: Verify WDK Installation
+        shell: pwsh
         run: |
-          msbuild UsbAsRam.vcxproj ^
-            /p:Configuration=Release ^
-            /p:Platform=x64 ^
-            /p:SpectreMitigation=false
+          if (-Not (Test-Path "C:\WDK\Include\10.0.22621.0\km\ntddk.h")) {
+            Write-Error "CRITICAL FAILURE: ntddk.h is not on the disk! The WDK installer failed."
+            exit 1
+          } else {
+            Write-Host "SUCCESS: ntddk.h found on the runner!"
+          }
+
+      - name: Build Driver
+        shell: cmd
+        run: |
+          msbuild UsbAsRam.vcxproj /p:Configuration=Release /p:Platform=x64 /p:SpectreMitigation=false
+
+      - name: Upload Output
+        uses: actions/upload-artifact@v4
+        with:
+          name: UsbAsRam-Driver
+          path: |
+            **/Release/*.sys
+            **/Release/*.inf
