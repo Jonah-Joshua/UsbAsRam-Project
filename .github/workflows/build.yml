@@ -1,17 +1,33 @@
-name: Driver Build Workflow
+name: Diagnostic & Build
 on: [push, workflow_dispatch]
 
 jobs:
-  build:
+  inspect:
     runs-on: windows-latest
     steps:
-      - name: Checkout Code
+      - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Find WDK Headers
+        shell: pwsh
+        run: |
+          Write-Host "Searching for ntddk.h..."
+          # Search common locations to find the version-specific folder
+          Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\Include\" -Filter "ntddk.h" -Recurse -ErrorAction SilentlyContinue | Select-Object FullName
+          
+          Write-Host "Checking Environment Variables..."
+          Get-ChildItem Env: | Where-Object Name -like "*WDK*"
+          Get-ChildItem Env: | Where-Object Name -like "*WindowsSdk*"
 
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
-      - name: Build Driver
-        shell: cmd
-        run: |
-          msbuild UsbAsRam.vcxproj /p:Configuration=Release /p:Platform=x64 /p:TargetVersion="Windows10" /p:SpectreMitigation=false
+      - name: Build Driver (Diagnostic Mode)
+        run: msbuild UsbAsRam.vcxproj /p:Configuration=Release /p:Platform=x64 /v:diag > build_log.txt
+        continue-on-error: true
+
+      - name: Upload Logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-diagnostics
+          path: build_log.txt
