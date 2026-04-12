@@ -2,7 +2,6 @@ name: Driver Build Workflow
 on: [push, workflow_dispatch]
 
 env:
-  # Opt into Node.js 24 to resolve deprecation warnings
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
@@ -18,30 +17,40 @@ jobs:
       - name: Install WDK
         shell: pwsh
         run: |
-          # Define the WDK installer URL (Targeting Windows 11/10 SDK 22621)
           $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2196230"
           $wdkPath = "$env:TEMP\wdksetup.exe"
-          
           Write-Host "Downloading WDK..."
           Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkPath
-          
-          Write-Host "Installing WDK... (This may take 2-5 minutes)"
-          # Quiet installation prevents the UI from hanging the runner
-          Start-Process -FilePath $wdkPath -ArgumentList "/quiet", "/norestart", "/ceip off" -Wait
+          Write-Host "Installing WDK..."
+          # The /features + flag ensures the headers and libs are actually installed
+          Start-Process -FilePath $wdkPath -ArgumentList "/quiet", "/norestart", "/features +", "/ceip off" -Wait
           Write-Host "WDK Installation complete."
 
-      - name: Build Driver (Release x64)
+      - name: Verify WDK Headers (Debug)
+        shell: pwsh
         run: |
-          msbuild UsbAsRam.vcxproj `
-            /p:Configuration=Release `
-            /p:Platform=x64 `
-            /p:SpectreMitigation=false `
-            /p:WindowsTargetPlatformVersion=10.0 `
+          $header = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\" -Filter "ntddk.h" -Recurse -ErrorAction SilentlyContinue
+          if ($header) { 
+            Write-Host "Found ntddk.h at: $($header.FullName)" 
+          } else { 
+            Write-Error "ntddk.h NOT FOUND. Build will fail." 
+          }
+
+      - name: Build Driver (Release x64)
+        shell: cmd
+        run: |
+          msbuild UsbAsRam.vcxproj ^
+            /p:Configuration=Release ^
+            /p:Platform=x64 ^
+            /p:SpectreMitigation=false ^
+            /p:WindowsTargetPlatformVersion=10.0 ^
             /p:TargetVersion=Windows10
 
-      - name: Save the Polished Output
+      - name: Upload Driver Binary
         uses: actions/upload-artifact@v4
         with:
           name: UsbAsRam-Binary
-          # Verify this path matches your project structure
-          path: x64/Release/
+          # Search for the .sys file wherever it was dropped
+          path: |
+            **/Release/*.sys
+            **/Release/*.inf
