@@ -8,41 +8,30 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Add MSBuild to PATH
-        uses: microsoft/setup-msbuild@v2
-
-      - name: Build Driver (Release x64)
-        run: |
-          msbuild UsbAsRam.vcxproj /p:Configuration=Release /p:Platform=x64 /p:SpectreMitigation=Spectre
-          
-      - name: Save the Polished Output
-        uses: actions/upload-artifact@v4
-        with:
-          name: UsbAsRam-Binary
-          path: x64/Release/
-jobs:
-  build:
-    runs-on: windows-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
       - name: Install WDK
         shell: pwsh
         run: |
-          # Define the WDK installer URL (matching your 22621 version)
+          # Define the WDK installer URL (matching 22621 version)
           $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2196230"
           $wdkPath = "$env:TEMP\wdksetup.exe"
           
           Write-Host "Downloading WDK..."
           Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkPath
           
-          Write-Host "Installing WDK..."
+          Write-Host "Installing WDK... (This may take 2-5 minutes)"
           Start-Process -FilePath $wdkPath -ArgumentList "/quiet", "/norestart", "/ceip off" -Wait
           Write-Host "WDK Installation complete."
 
-      - name: Build Driver
-        run: msbuild UsbAsRam.vcxproj /p:Configuration=Release /p:Platform=x64 /p:SpectreMitigation=Spectre    
+      - name: Build Driver (Release x64)
+        run: msbuild UsbAsRam.vcxproj /p:Configuration=Release /p:Platform=x64 /p:SpectreMitigation=Spectre
+
+      - name: Save the Polished Output
+        uses: actions/upload-artifact@v4
+        with:
+          name: UsbAsRam-Binary
+          # Note: MSBuild usually outputs to x64/Release/ or UsbAsRam/x64/Release/
+          # Check your build logs if the path is slightly different
+          path: x64/Release/
