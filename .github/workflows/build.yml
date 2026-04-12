@@ -1,9 +1,6 @@
 name: Driver Build Workflow
 on: [push, workflow_dispatch]
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
   build:
     runs-on: windows-latest
@@ -14,34 +11,7 @@ jobs:
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
-      - name: Install WDK to C:\WDK
-        shell: pwsh
-        run: |
-          $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2196230"
-          $wdkPath = "$env:TEMP\wdksetup.exe"
-          Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkPath
-          Write-Host "Installing WDK... This will take a few minutes."
-          Start-Process -FilePath $wdkPath -ArgumentList "/quiet", "/installpath C:\WDK", "/features +", "/ceip off" -Wait
-
-      - name: Verify WDK Installation
-        shell: pwsh
-        run: |
-          if (-Not (Test-Path "C:\WDK\Include\10.0.22621.0\km\ntddk.h")) {
-            Write-Error "CRITICAL FAILURE: ntddk.h is not on the disk! The WDK installer failed."
-            exit 1
-          } else {
-            Write-Host "SUCCESS: ntddk.h found on the runner!"
-          }
-
       - name: Build Driver
         shell: cmd
         run: |
           msbuild UsbAsRam.vcxproj /p:Configuration=Release /p:Platform=x64 /p:SpectreMitigation=false
-
-      - name: Upload Output
-        uses: actions/upload-artifact@v4
-        with:
-          name: UsbAsRam-Driver
-          path: |
-            **/Release/*.sys
-            **/Release/*.inf
