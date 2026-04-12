@@ -1,9 +1,0 @@
-<Project>
-  <PropertyGroup>
-    <WindowsSdkDir>C:\Program Files (x86)\Windows Kits\10\</WindowsSdkDir>
-    <TargetPlatformVersion>10.0.22621.0</TargetPlatformVersion>
-    
-    <IncludePath>$(WindowsSdkDir)Include\$(TargetPlatformVersion)\km;$(WindowsSdkDir)Include\$(TargetPlatformVersion)\shared;$(WindowsSdkDir)Include\$(TargetPlatformVersion)\um;$(IncludePath)</IncludePath>
-    <LibraryPath>$(WindowsSdkDir)Lib\$(TargetPlatformVersion)\km\x64;$(WindowsSdkDir)Lib\$(TargetPlatformVersion)\um\x64;$(LibraryPath)</LibraryPath>
-  </PropertyGroup>
-</Project>
