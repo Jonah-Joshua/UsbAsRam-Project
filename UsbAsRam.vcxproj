@@ -19,7 +19,7 @@
     <Platform Condition="'$(Platform)' == ''">x64</Platform>
     <RootNamespace>UsbAsRam</RootNamespace>
     <ProjectName>UsbAsRam</ProjectName>
-    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformVersion>$(LatestTargetPlatformVersion)</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -41,11 +41,7 @@
     <KMDF_VERSION_MAJOR>1</KMDF_VERSION_MAJOR>
     <KMDF_VERSION_MINOR>15</KMDF_VERSION_MINOR>
     <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
-    <VCToolsVersion>
-    </VCToolsVersion>
-    <MSVCPreviewEnabled>
-    </MSVCPreviewEnabled>
-    <SpectreMitigation>false</SpectreMitigation>
+    <SpectreMitigation>Spectre</SpectreMitigation>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings" />
@@ -58,12 +54,12 @@
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <TargetName>UsbAsRam</TargetName>
-    <IncludePath>$(ProjectDir);$(ProjectDir)third_party\lz4;$(IncludePath)</IncludePath>
+    <IncludePath>$(ProjectDir);$(ProjectDir)third_party\lz4;$(IncludePath);$(Kernel_IncludePath)</IncludePath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <TargetName>UsbAsRam</TargetName>
-    <IncludePath>$(VC_IncludePath)\spectre;$(ProjectDir);$(ProjectDir)third_party\lz4;$(IncludePath)</IncludePath>
-    <LibraryPath>$(VC_LibraryPath_x64_VC)\spectre;$(LibraryPath)</LibraryPath>
+    <IncludePath>$(VC_IncludePath)\spectre;$(ProjectDir);$(ProjectDir)third_party\lz4;$(IncludePath);$(Kernel_IncludePath)</IncludePath>
+    <LibraryPath>$(VC_LibraryPath_x64_VC)\spectre;$(LibraryPath);$(DDK_LIB_PATH)</LibraryPath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
@@ -78,7 +74,7 @@
     <ClCompile>
       <TreatWarningAsError>false</TreatWarningAsError>
       <WarningLevel>Level4</WarningLevel>
-      <AdditionalIncludeDirectories>C:\Program Files (x86)\Windows Kits\10\Include\10.0.22621.0\uwp;C:\Program Files (x86)\Windows Kits\10\Include\10.0.22621.0\shared;C:\Program Files (x86)\Windows Kits\10\Include\10.0.22621.0\km</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories);$(Kernel_IncludePath);$(IncludePath)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <AdditionalDependencies>%(AdditionalDependencies);$(KernelBufferOverflowLib);$(DDK_LIB_PATH)wdmsec.lib</AdditionalDependencies>
