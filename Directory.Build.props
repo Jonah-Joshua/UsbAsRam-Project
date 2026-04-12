@@ -1,6 +1,9 @@
 <Project>
   <PropertyGroup>
-    <IncludePath>C:\WDK\Include\10.0.22621.0\km;C:\WDK\Include\10.0.22621.0\shared;C:\WDK\Include\10.0.22621.0\um;C:\WDK\Include\10.0.22621.0\ucrt;$(IncludePath)</IncludePath>
-    <LibraryPath>C:\WDK\Lib\10.0.22621.0\km\x64;C:\WDK\Lib\10.0.22621.0\um\x64;$(LibraryPath)</LibraryPath>
+    <WDKContentRoot>C:\Program Files (x86)\Windows Kits\10</WDKContentRoot>
+    <WDKVersion>10.0.22621.0</WDKVersion>
+    
+    <IncludePath>$(WDKContentRoot)\Include\$(WDKVersion)\km;$(WDKContentRoot)\Include\$(WDKVersion)\shared;$(WDKContentRoot)\Include\$(WDKVersion)\um;$(IncludePath)</IncludePath>
+    <LibraryPath>$(WDKContentRoot)\Lib\$(WDKVersion)\km\x64;$(WDKContentRoot)\Lib\$(WDKVersion)\um\x64;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
 </Project>
