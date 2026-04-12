@@ -1,33 +1,34 @@
-name: Diagnostic & Build
+name: Debug WDK Environment
 on: [push, workflow_dispatch]
 
 jobs:
-  inspect:
+  diagnose:
     runs-on: windows-latest
     steps:
-      - name: Checkout
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Find WDK Headers
+      - name: Locate WDK Headers
         shell: pwsh
         run: |
-          Write-Host "Searching for ntddk.h..."
-          # Search common locations to find the version-specific folder
+          Write-Host "--- Searching for ntddk.h ---"
           Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\Include\" -Filter "ntddk.h" -Recurse -ErrorAction SilentlyContinue | Select-Object FullName
           
-          Write-Host "Checking Environment Variables..."
-          Get-ChildItem Env: | Where-Object Name -like "*WDK*"
-          Get-ChildItem Env: | Where-Object Name -like "*WindowsSdk*"
+          Write-Host "--- Checking for Reserved Property Conflicts ---"
+          # This looks for any line that tries to define a property named 'PropertyGroup'
+          Select-String -Path "UsbAsRam.vcxproj" -Pattern "<PropertyGroup>" -Context 1,1
 
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
-      - name: Build Driver (Diagnostic Mode)
-        run: msbuild UsbAsRam.vcxproj /p:Configuration=Release /p:Platform=x64 /v:diag > build_log.txt
+      - name: Detailed Build Log
+        shell: cmd
+        run: |
+          msbuild UsbAsRam.vcxproj /p:Configuration=Release /p:Platform=x64 /v:diag > msbuild_diag.txt
         continue-on-error: true
 
       - name: Upload Logs
         uses: actions/upload-artifact@v4
         with:
           name: build-diagnostics
-          path: build_log.txt
+          path: msbuild_diag.txt
