@@ -1,0 +1,16 @@
+image: Visual Studio 2022
+configuration: Release
+platform: x64
+
+# This tells AppVeyor NOT to use its automatic build logic
+build: off
+
+# This is the manual command that forces exactly what we want
+build_script:
+  - msbuild UsbAsRam.vcxproj /p:Configuration=Release /p:Platform=x64 /p:SpectreMitigation=false /verbosity:minimal /logger:"C:\Program Files\AppVeyor\BuildAgent\Appveyor.MSBuildLogger.dll"
+
+artifacts:
+  - path: 'x64\Release\*.sys'
+    name: Driver
+  - path: 'x64\Release\*.inf'
+    name: DriverInfo
