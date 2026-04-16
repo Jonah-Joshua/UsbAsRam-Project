@@ -5,7 +5,7 @@ platform: x64
 build:
   project: UsbAsRam.vcxproj
   verbosity: minimal
-  # This line forces MSBuild to use the right settings
+  # This is the "magic" line that fixes MSB8013
   options: /p:Configuration=Release /p:Platform=x64
 
 artifacts:
