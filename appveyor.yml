@@ -6,16 +6,14 @@ build: off
 
 build_script:
   - ps: |
-      # We found 10.0.22000.0 in your search, let's use it explicitly
-      $env:WindowsSdkDir = "C:\Program Files (x86)\Windows Kits\10\"
-      $env:WindowsSDKVersion = "10.0.22000.0"
-      
-      # Run MSBuild with the explicit SDK/WDK version targets
+      # Force MSBuild to use the 19041 version which we know is on the disk
+      $sdkVer = "10.0.19041.0"
       msbuild UsbAsRam.vcxproj `
         /p:Configuration=Release `
         /p:Platform=x64 `
-        /p:TargetPlatformVersion=10.0.22000.0 `
-        /p:WindowsTargetPlatformVersion=10.0.22000.0 `
+        /p:WindowsTargetPlatformVersion=$sdkVer `
+        /p:TargetPlatformVersion=$sdkVer `
+        /p:LatestTargetPlatformVersion=$sdkVer `
         /p:SpectreMitigation=false `
         /v:m `
         /logger:"C:\Program Files\AppVeyor\BuildAgent\Appveyor.MSBuildLogger.dll"
