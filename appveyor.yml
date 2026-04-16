@@ -2,25 +2,23 @@ image: Visual Studio 2022
 configuration: Release
 platform: x64
 
-install:
-  # This ensures the WDK paths are added to the system path properly
-  - ps: |
-      $env:WDKContentRoot = "C:\Program Files (x86)\Windows Kits\10"
-      Write-Host "Verifying WDK folder..."
-      if (Test-Path "$env:WDKContentRoot\Include\10.0.22621.0\km") { 
-          Write-Host "WDK Found." 
-      } else { 
-          Write-Host "WDK not in expected subfolder, searching..."
-          Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\Include\" -Filter "ntddk.h" -Recurse | Select-Object FullName
-      }
-
 build: off
 
 build_script:
-  # We use 'call' to ensure the VS dev environment variables are loaded
-  - cmd: |
-      call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-      msbuild UsbAsRam.vcxproj /p:Configuration=Release /p:Platform=x64 /p:SpectreMitigation=false /p:TargetVersion="Windows10" /v:m /logger:"C:\Program Files\AppVeyor\BuildAgent\Appveyor.MSBuildLogger.dll"
+  - ps: |
+      # We found 10.0.22000.0 in your search, let's use it explicitly
+      $env:WindowsSdkDir = "C:\Program Files (x86)\Windows Kits\10\"
+      $env:WindowsSDKVersion = "10.0.22000.0"
+      
+      # Run MSBuild with the explicit SDK/WDK version targets
+      msbuild UsbAsRam.vcxproj `
+        /p:Configuration=Release `
+        /p:Platform=x64 `
+        /p:TargetPlatformVersion=10.0.22000.0 `
+        /p:WindowsTargetPlatformVersion=10.0.22000.0 `
+        /p:SpectreMitigation=false `
+        /v:m `
+        /logger:"C:\Program Files\AppVeyor\BuildAgent\Appveyor.MSBuildLogger.dll"
 
 artifacts:
   - path: 'x64\Release\*.sys'
