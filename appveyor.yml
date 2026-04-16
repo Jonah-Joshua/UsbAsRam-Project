@@ -2,12 +2,14 @@ image: Visual Studio 2022
 configuration: Release
 platform: x64
 
-# This tells AppVeyor NOT to use its automatic build logic
 build: off
 
-# This is the manual command that forces exactly what we want
 build_script:
-  - msbuild UsbAsRam.vcxproj /p:Configuration=Release /p:Platform=x64 /p:SpectreMitigation=false /verbosity:minimal /logger:"C:\Program Files\AppVeyor\BuildAgent\Appveyor.MSBuildLogger.dll"
+  - ps: |
+      # Find the latest WDK install path and set it for the build session
+      $wdkPath = "C:\Program Files (x86)\Windows Kits\10"
+      $env:WDKContentRoot = $wdkPath
+  - msbuild UsbAsRam.vcxproj /p:Configuration=Release /p:Platform=x64 /p:SpectreMitigation=false /p:TargetVersion="Windows10" /verbosity:minimal /logger:"C:\Program Files\AppVeyor\BuildAgent\Appveyor.MSBuildLogger.dll"
 
 artifacts:
   - path: 'x64\Release\*.sys'
