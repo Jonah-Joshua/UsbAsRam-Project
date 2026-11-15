@@ -669,6 +669,10 @@ where
         let length = u32::from_be_bytes(header[24..28].try_into().expect("fixed slice"));
 
         if command == CMD_DISC {
+            // DISC is a barrier even though it has no reply: wait for every
+            // accepted request on this connection so a disconnect cannot drop
+            // writes the client already submitted.
+            state.wait_idle();
             return Ok(());
         }
         if length > MAX_REQUEST_LEN {

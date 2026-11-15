@@ -188,6 +188,9 @@ impl Shard {
                 continue;
             };
             if page.dirty {
+                // Advance the hand so a page that is being written continuously
+                // cannot monopolize spill selection and starve other dirty pages.
+                self.hand = (index + 1) % self.clock.len();
                 return Some((page_no, Box::new(AlignedPage(page.data.0)), page.generation));
             }
         }
@@ -317,6 +320,16 @@ mod tests {
         assert_eq!(snapshot.0[0], 7);
         assert_eq!(generation, 3);
         assert_eq!(shard.pages.len(), 1);
+    }
+
+    #[test]
+    fn spill_selection_advances_the_clock_hand() {
+        let mut shard = Shard::new(4);
+        shard.insert(0, CachePage::new(page(1), 1, true));
+        shard.insert(1, CachePage::new(page(2), 2, true));
+        let first = shard.dirty_snapshot().expect("first victim");
+        let second = shard.dirty_snapshot().expect("second victim");
+        assert_ne!(first.0, second.0);
     }
 
     #[test]

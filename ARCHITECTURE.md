@@ -302,10 +302,12 @@ jobs own their payload buffer until the write completes.
 
 The NBD specification allows out-of-order command processing. `FLUSH` and `FUA`
 are the exceptions: the reader drains the connection's outstanding requests
-before executing them, then calls `Store::flush` before replying. A write batch
-that a client completes before a flush is therefore covered by that flush. As
-the specification requires, clients must not pipeline overlapping writes without
-ordering; independent pages are safe to pipeline.
+before executing them, then calls `Store::flush` before replying. `DISC` drains
+the same way even though it has no reply, so a disconnect cannot drop a write
+the client already submitted. A write batch that a client completes before a
+flush is therefore covered by that flush. As the specification requires, clients
+must not pipeline overlapping writes without ordering; independent pages are
+safe to pipeline.
 
 `TRIM` and `WRITE_ZEROES` are implemented as zeroing writes. They are visible
 immediately and become durable on the next flush. The server advertises

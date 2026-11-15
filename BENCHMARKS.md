@@ -55,16 +55,16 @@ difference is noise. Compare changes only against runs on the same runner class.
 
 | Phase | Operations | IOPS | Throughput |
 | --- | ---: | ---: | ---: |
-| `hot_read` | 3,206,592 | 6,411,511 | 24.46 GiB/s |
-| `hot_write` | 2,660,523 | 5,320,143 | 20.30 GiB/s |
-| `cold_read` | 484,167 | 968,148 | 3.69 GiB/s |
+| `hot_read` | 3,922,064 | 7,842,521 | 29.92 GiB/s |
+| `hot_write` | 3,616,537 | 7,231,506 | 27.59 GiB/s |
+| `cold_read` | 713,560 | 1,426,796 | 5.44 GiB/s |
 
 Single-thread hot-read latency over 20,000 samples:
 
 | Percentile | Latency |
 | --- | ---: |
-| p50 | 327 ns |
-| p99 | 558 ns |
+| p50 | 391 ns |
+| p99 | 741 ns |
 
 These are userspace round-trip timings for a 4 KiB page that is already in the
 cache. They exclude the NBD socket, the kernel block layer, and the client.

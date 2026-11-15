@@ -39,6 +39,9 @@ Keep a Changelog, and the project adheres to Semantic Versioning.
   load can no longer install a stale clean page or resurrect an older page body.
 - `make_space` reuses a loaded page across a full-shard retry, avoiding a second
   cold read on every cache miss when the shard is full.
+- Spill selection advances the CLOCK hand, so a continuously written page cannot
+  monopolize eviction and starve other dirty pages.
+- `DISC` drains outstanding requests before the connection closes.
 
 ## [1.0.0] - 2026-11-15
 
