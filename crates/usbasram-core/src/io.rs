@@ -172,6 +172,11 @@ impl Io {
             if flags != 0 {
                 options.custom_flags(flags);
             }
+            eprintln!(
+                "DBG open {} flags={flags:#x} status={:?}",
+                path.display(),
+                self.status
+            );
             options.open(path)
         }
 
@@ -790,7 +795,11 @@ mod iocp {
         // file returns the existing port and is harmless.
         let result = unsafe { CreateIoCompletionPort(handle, port, 0, 0) };
         if result.is_null() {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            eprintln!(
+                "DBG associate failed port={port:?} handle={handle:?} error={error:?}"
+            );
+            return Err(error);
         }
         Ok(())
     }
@@ -806,11 +815,8 @@ mod iocp {
         // SAFETY: OVERLAPPED is a plain data structure; zero is a valid value
         // for every field.
         let mut overlapped: OVERLAPPED = unsafe { zeroed() };
-        // SAFETY: the union is initialized by zeroing and then only written.
-        unsafe {
-            overlapped.Anonymous.Anonymous.Offset = offset as u32;
-            overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
-        }
+        overlapped.Anonymous.Anonymous.Offset = offset as u32;
+        overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
         let mut transferred = 0u32;
         let operation = if read { "read" } else { "write" };
         // SAFETY: `pointer` points to `len` bytes in the backend's registered
