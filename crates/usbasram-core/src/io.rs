@@ -666,7 +666,7 @@ mod iocp {
     use std::sync::Mutex;
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, GetHandleInformation, HANDLE,
+        CloseHandle, GetHandleInformation, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, HANDLE,
         INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
