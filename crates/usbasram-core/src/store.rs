@@ -217,7 +217,7 @@ impl Store {
 
         recover_sidecars(&config.path, config.create)?;
 
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(config.create)

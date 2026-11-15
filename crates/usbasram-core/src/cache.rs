@@ -115,7 +115,7 @@ pub(crate) struct PageCache {
 impl PageCache {
     pub(crate) fn new(cache_pages: usize) -> Self {
         let cache_pages = cache_pages.max(1);
-        let target = (cache_pages / 256).max(1).min(64).next_power_of_two();
+        let target = (cache_pages / 256).clamp(1, 64).next_power_of_two();
         let shard_count = target.min(cache_pages).max(1);
         let base = cache_pages / shard_count;
         let extra = cache_pages % shard_count;

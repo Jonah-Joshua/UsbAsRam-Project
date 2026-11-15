@@ -61,6 +61,7 @@ impl Metrics {
         counter.fetch_add(value, Ordering::Relaxed);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn snapshot(
         &self,
         cache_pages: usize,
