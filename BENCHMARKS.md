@@ -31,6 +31,31 @@ each phase. CI uploads the latest result as the `benchmark-json` artifact on the
 | `hot_write` | Entire logical size | RAM cache write path and generation allocation |
 | `cold_read` | 4 MiB | Positioned file reads, CRC32C verification, LZ4 decompression, and cache fills |
 
+## Reference CI run
+
+The following run is from the `CI` workflow on 2026-11-15. It is a **software
+path measurement on a GitHub-hosted runner**, not a USB device measurement. The
+backing file lives on the runner's local disk and may be served from the OS page
+cache, so `cold_read` here overstates what a real USB flash drive can do.
+
+- Store: 64 MiB, compression on
+- Hot cache: 64 MiB
+- Cold cache: 4 MiB
+- Threads: 4
+- Phase duration: 0.5 s
+- Runner: `ubuntu-latest` (shared GitHub-hosted hardware)
+
+| Phase | Operations | IOPS | Throughput |
+| --- | ---: | ---: | ---: |
+| `hot_read` | 2,883,810 | 5,766,337 | 22.00 GiB/s |
+| `hot_write` | 2,999,948 | 5,998,607 | 22.88 GiB/s |
+| `cold_read` | 718,827 | 1,437,364 | 5.48 GiB/s |
+
+Use these numbers to compare code changes on the same class of runner, not to
+predict USB performance. Attach a real USB device and rerun the benchmark for
+device-specific results. The latest JSON is always available as the
+`benchmark-json` artifact on the CI run.
+
 ## How to read the numbers
 
 - `hot_read` and `hot_write` are upper bounds for this engine. They depend on
