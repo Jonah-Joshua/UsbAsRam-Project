@@ -1,27 +1,28 @@
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 
-use crate::cache::{AlignedPage, CachePage, PageCache};
+use crate::cache::{CachePage, PageCache};
 use crate::error::{Error, Result};
 use crate::format::{
     RecordHeader, Superblock, DATA_OFFSET, MAX_STORED_LEN, RECORD_FLAG_COMPRESSED,
     RECORD_HEADER_SIZE, SUPERBLOCK_SIZE, SUPERBLOCK_SLOTS,
 };
-use crate::io::{align_up, read_exact_at, write_all_at};
+use crate::io::{align_up, Io, IoMode, OpenSpec};
+use crate::mem::{hugepages_active, PageHandle};
 use crate::metrics::{Metrics, Stats};
 use crate::PAGE_SIZE;
 
-const MAX_FLUSH_BATCH: usize = 256;
+const MAX_FLUSH_BATCH: usize = 1024;
 const ZERO_PAGE: [u8; PAGE_SIZE] = [0u8; PAGE_SIZE];
 const MAX_RECORD_LEN: u64 = ((RECORD_HEADER_SIZE + PAGE_SIZE + 7) & !7) as u64;
 const COMPACT_BATCH_BYTES: usize = 1024 * 1024;
 
-type DirtyPage = (u64, Box<AlignedPage>, u64);
+type DirtyPage = (u64, PageHandle, u64);
 type PageWrite<'a> = (u64, &'a [u8], u64);
 
 /// A page whose payload has been compressed (or copied) but whose record header
@@ -54,6 +55,20 @@ pub struct StoreConfig {
     pub compress: bool,
     /// Create the store if the backing file does not exist.
     pub create: bool,
+    /// Requested positioned-I/O backend. Unsupported requests fall back to
+    /// portable I/O and report the effective mode in [`StoreInfo`].
+    pub io_mode: IoMode,
+    /// Back hot-cache pages and transfer buffers with large pages when the
+    /// operating system and the current user permit it.
+    pub hugepages: bool,
+    /// Group dirty flushes into erase-block-sized sequential windows.
+    pub coalesce: bool,
+    /// Smallest coalescing window in bytes.
+    pub coalesce_min_bytes: u64,
+    /// Largest coalescing window in bytes.
+    pub coalesce_max_bytes: u64,
+    /// Granularity to which coalescing windows are rounded.
+    pub erase_block_bytes: u64,
 }
 
 impl StoreConfig {
@@ -67,6 +82,12 @@ impl StoreConfig {
             log_bytes: None,
             compress: true,
             create: true,
+            io_mode: IoMode::Portable,
+            hugepages: false,
+            coalesce: true,
+            coalesce_min_bytes: 128 * 1024,
+            coalesce_max_bytes: 4 * 1024 * 1024,
+            erase_block_bytes: 128 * 1024,
         }
     }
 
@@ -91,6 +112,33 @@ impl StoreConfig {
     /// Allow creating a new store file.
     pub fn with_create(mut self, create: bool) -> Self {
         self.create = create;
+        self
+    }
+
+    /// Select the positioned-I/O backend.
+    pub fn with_io_mode(mut self, io_mode: IoMode) -> Self {
+        self.io_mode = io_mode;
+        self
+    }
+
+    /// Opt in to large-page-backed cache pages and I/O buffers.
+    pub fn with_hugepages(mut self, hugepages: bool) -> Self {
+        self.hugepages = hugepages;
+        self
+    }
+
+    /// Configure the sequential write coalescer.
+    pub fn with_coalescing(
+        mut self,
+        enabled: bool,
+        min_bytes: u64,
+        max_bytes: u64,
+        erase_block_bytes: u64,
+    ) -> Self {
+        self.coalesce = enabled;
+        self.coalesce_min_bytes = min_bytes;
+        self.coalesce_max_bytes = max_bytes;
+        self.erase_block_bytes = erase_block_bytes;
         self
     }
 
@@ -120,6 +168,17 @@ impl StoreConfig {
                 return Err(Error::Config("log_bytes must be a multiple of 4096".into()));
             }
         }
+        if self.coalesce_min_bytes < PAGE_SIZE as u64
+            || self.coalesce_min_bytes % PAGE_SIZE as u64 != 0
+            || self.coalesce_max_bytes < self.coalesce_min_bytes
+            || self.coalesce_max_bytes % PAGE_SIZE as u64 != 0
+            || self.erase_block_bytes == 0
+        {
+            return Err(Error::Config(
+                "invalid coalescing window: expected page-aligned min <= max and a non-zero erase block"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -138,6 +197,22 @@ pub struct StoreInfo {
     pub compressed: bool,
     pub pages_on_disk: usize,
     pub superblock_slot: usize,
+    /// Backend that is actually in use.
+    pub io_mode: IoMode,
+    /// The file bypasses the operating-system page cache.
+    pub io_direct: bool,
+    /// The Linux ring runs without submission syscalls.
+    pub io_sqpoll: bool,
+    /// Large pages were requested for the hot cache and I/O buffers.
+    pub hugepages_requested: bool,
+    /// At least one large-page allocation is live.
+    pub hugepages_active: bool,
+    /// Current adaptive coalescing window.
+    pub coalesce_target_bytes: u64,
+    /// Coalescing was requested for this open store.
+    pub coalesce_enabled: bool,
+    pub coalesce_min_bytes: u64,
+    pub coalesce_max_bytes: u64,
 }
 
 /// Result of a full integrity scan of the cold log.
@@ -160,8 +235,11 @@ fn checked_min_log_bytes(size_bytes: u64) -> Result<u64> {
     // Leave room for one full flush batch while every logical page is live.
     // Compaction rewrites each live page, then the batch is appended before the
     // index is updated, so a margin is required to avoid a false "log full".
+    // A batch can never contain more pages than the store itself, so tiny
+    // stores do not have to reserve the full 1024-page window.
+    let extra = (MAX_FLUSH_BATCH as u64).min(pages);
     let records = pages
-        .checked_add(MAX_FLUSH_BATCH as u64)
+        .checked_add(extra)
         .ok_or_else(|| Error::Config("store is too large for this format".into()))?;
     records
         .checked_mul(MAX_RECORD_LEN)
@@ -175,6 +253,125 @@ fn default_log_bytes(size_bytes: u64) -> Result<u64> {
         .checked_add(size_bytes / 4)
         .ok_or_else(|| Error::Config("store is too large for this format".into()))?;
     Ok(align_up(preferred.max(minimum), PAGE_SIZE as u64))
+}
+
+fn round_up_to(value: u64, granularity: u64) -> u64 {
+    if granularity <= 1 {
+        value
+    } else {
+        value.div_ceil(granularity) * granularity
+    }
+}
+
+/// Adaptive write coalescer.
+///
+/// Starting at the smallest erase-block-friendly window, the coalescer doubles
+/// the flush batch until it reaches the configured maximum, then periodically
+/// probes smaller windows again. Windows are rounded to the device's erase
+/// block size so sequential log appends arrive as whole erase-block groups
+/// rather than a stream of isolated page writes. The observed bytes-per-nanosecond
+/// of real appends steers the direction of travel, so a fast drive settles on
+/// smaller windows while a latency-bound USB stick keeps larger batches.
+struct Coalescer {
+    enabled: bool,
+    min_bytes: u64,
+    max_bytes: u64,
+    erase_block_bytes: u64,
+    target_bytes: u64,
+    sample_batches: u32,
+    sample_bytes: u64,
+    sample_nanos: u64,
+    best_bytes_per_nano: f64,
+    batches_at_target: u32,
+}
+
+impl Coalescer {
+    fn new(config: &StoreConfig) -> Self {
+        let max_bytes = config.coalesce_max_bytes.max(config.coalesce_min_bytes);
+        let min_bytes = config.coalesce_min_bytes.min(max_bytes);
+        let target_bytes = if config.coalesce {
+            round_up_to(min_bytes, config.erase_block_bytes).min(max_bytes)
+        } else {
+            PAGE_SIZE as u64
+        };
+        Self {
+            enabled: config.coalesce,
+            min_bytes,
+            max_bytes,
+            erase_block_bytes: config.erase_block_bytes,
+            target_bytes,
+            sample_batches: 0,
+            sample_bytes: 0,
+            sample_nanos: 0,
+            best_bytes_per_nano: 0.0,
+            batches_at_target: 0,
+        }
+    }
+
+    fn target_bytes(&self) -> u64 {
+        self.target_bytes
+    }
+
+    /// Number of dirty pages a flush should gather for the current window.
+    fn batch_pages(&self) -> usize {
+        ((self.target_bytes / PAGE_SIZE as u64) as usize).clamp(1, MAX_FLUSH_BATCH)
+    }
+
+    fn observe(&mut self, bytes: u64, elapsed: std::time::Duration) {
+        if bytes == 0 || !self.enabled {
+            return;
+        }
+        self.sample_batches += 1;
+        self.sample_bytes = self.sample_bytes.saturating_add(bytes);
+        self.sample_nanos = self
+            .sample_nanos
+            .saturating_add(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX).max(1));
+        if self.sample_batches < 8 {
+            return;
+        }
+
+        let bytes_per_nano = self.sample_bytes as f64 / self.sample_nanos.max(1) as f64;
+        if bytes_per_nano > self.best_bytes_per_nano {
+            self.best_bytes_per_nano = bytes_per_nano;
+        }
+
+        let clearly_worse = self.best_bytes_per_nano > 0.0
+            && bytes_per_nano * 1.15 < self.best_bytes_per_nano;
+        if clearly_worse && self.target_bytes < self.max_bytes {
+            self.grow();
+        } else {
+            self.batches_at_target += self.sample_batches;
+            if self.batches_at_target >= 32 {
+                if self.target_bytes < self.max_bytes {
+                    self.grow();
+                } else {
+                    self.shrink();
+                }
+                self.batches_at_target = 0;
+            }
+        }
+
+        self.sample_batches = 0;
+        self.sample_bytes = 0;
+        self.sample_nanos = 0;
+    }
+
+    fn grow(&mut self) {
+        let next = round_up_to(self.target_bytes.saturating_mul(2), self.erase_block_bytes)
+            .min(self.max_bytes);
+        if next > self.target_bytes {
+            self.target_bytes = next;
+        }
+    }
+
+    fn shrink(&mut self) {
+        let previous = round_up_to(self.target_bytes / 2, self.erase_block_bytes)
+            .max(self.min_bytes)
+            .min(self.max_bytes);
+        if previous < self.target_bytes {
+            self.target_bytes = previous;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -219,8 +416,11 @@ pub struct Store {
     cache: PageCache,
     writer: Mutex<WriterState>,
     flush_lock: Mutex<()>,
+    coalescer: Mutex<Coalescer>,
+    coalesce_batch_limit: usize,
     next_generation: AtomicU64,
     metrics: Metrics,
+    io: Io,
 }
 
 impl Store {
@@ -240,11 +440,22 @@ impl Store {
 
         recover_sidecars(&config.path, config.create)?;
 
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(config.create)
-            .open(&config.path)?;
+        let spec = if config.create {
+            OpenSpec::READ_WRITE_CREATE
+        } else {
+            OpenSpec::READ_WRITE
+        };
+        let mut io = Io::new(config.io_mode, config.hugepages);
+        let file = match io.open(&config.path, spec) {
+            Ok(file) => file,
+            Err(_) if io.status().direct => {
+                // The filesystem may reject the direct-open flags even though
+                // the platform supports them. Keep the store usable.
+                io = Io::new(IoMode::Portable, config.hugepages);
+                io.open(&config.path, spec)?
+            }
+            Err(error) => return Err(error.into()),
+        };
         if !file.metadata()?.is_file() {
             return Err(Error::NotAFile(config.path.clone()));
         }
@@ -267,12 +478,21 @@ impl Store {
                 config.compress,
             );
             file.set_len(DATA_OFFSET)?;
-            write_all_at(&file, &superblock.encode(), 0)?;
-            write_all_at(&file, &[0u8; SUPERBLOCK_SIZE], SUPERBLOCK_SIZE as u64)?;
+            io.write_all_at(&file, &superblock.encode(), 0)?;
+            io.write_all_at(&file, &[0u8; SUPERBLOCK_SIZE], SUPERBLOCK_SIZE as u64)?;
             file.sync_all()?;
             (superblock, 0usize)
         } else {
-            let (superblock, slot) = load_best_superblock(&file, len)?;
+            let (superblock, slot) = load_best_superblock(&file, &io, len)?;
+            if io.status().direct && len % PAGE_SIZE as u64 != 0 {
+                // Older stores end on an 8-byte record boundary. Direct I/O
+                // needs whole sectors, so zero-pad the tail once. The recovery
+                // scan stops at the first all-zero header, so the padding is
+                // invisible. Only do this after a valid superblock has been
+                // found, so a stray file is never extended.
+                file.set_len(align_up(len, PAGE_SIZE as u64))?;
+                file.sync_all()?;
+            }
             if superblock.capacity_pages != capacity_pages {
                 return Err(Error::Config(format!(
                     "store capacity is {} pages, configuration says {capacity_pages}",
@@ -291,7 +511,7 @@ impl Store {
         };
 
         let log_bytes = superblock.log_bytes;
-        let (index, recovered_head) = scan_log(&file, &superblock)?;
+        let (index, recovered_head) = scan_log(&file, &io, &superblock)?;
         let max_generation = index
             .values()
             .map(|extent| extent.generation)
@@ -309,6 +529,16 @@ impl Store {
             needs_checkpoint: recovered_head != superblock.head,
         };
 
+        let cache = PageCache::new(cache_pages, config.hugepages);
+        let coalescer = Coalescer::new(&config);
+        // Worst-case headroom after compacting every live page. New stores
+        // reserve a full 1024-page window; older stores with tighter logs use
+        // whatever margin their superblock guarantees.
+        let coalesce_batch_limit = (log_bytes / MAX_RECORD_LEN)
+            .saturating_sub(capacity_pages)
+            .clamp(1, MAX_FLUSH_BATCH as u64);
+        let coalesce_batch_limit =
+            usize::try_from(coalesce_batch_limit).unwrap_or(MAX_FLUSH_BATCH);
         let store = Self {
             config,
             capacity_bytes: capacity_pages * PAGE_SIZE as u64,
@@ -318,11 +548,14 @@ impl Store {
             compress: superblock.compressed(),
             file: RwLock::new(Some(file)),
             index: RwLock::new(index),
-            cache: PageCache::new(cache_pages),
+            cache,
             writer: Mutex::new(writer),
             flush_lock: Mutex::new(()),
+            coalescer: Mutex::new(coalescer),
+            coalesce_batch_limit,
             next_generation: AtomicU64::new(next_generation),
             metrics: Metrics::default(),
+            io,
         };
 
         // Persist a recovered post-checkpoint tail immediately and clean up any
@@ -342,27 +575,34 @@ impl Store {
 
     /// Open an existing store without requiring the caller to know its size.
     pub fn open_existing(path: impl Into<PathBuf>, cache_bytes: u64) -> Result<Self> {
-        let path = path.into();
+        let mut config = StoreConfig::new(path, 0);
+        config.cache_bytes = cache_bytes;
+        Self::open_existing_with(config)
+    }
+
+    /// Open an existing store, preserving tuning fields such as the I/O mode,
+    /// hugepage preference, and coalescer window from `config`.
+    ///
+    /// `size_bytes`, `log_bytes`, `compress`, and `create` are read from the
+    /// store's superblock and replace the supplied values.
+    pub fn open_existing_with(mut config: StoreConfig) -> Result<Self> {
+        let portable = Io::new(IoMode::Portable, false);
         let superblock = {
-            let file = File::open(&path)?;
+            let file = File::open(&config.path)?;
             let len = file.metadata()?.len();
             if len < DATA_OFFSET {
                 return Err(Error::corrupt("store file is incomplete"));
             }
-            load_best_superblock(&file, len)?.0
+            load_best_superblock(&file, &portable, len)?.0
         };
-        let size_bytes = superblock
+        config.size_bytes = superblock
             .capacity_pages
             .checked_mul(PAGE_SIZE as u64)
             .ok_or_else(|| Error::corrupt("store capacity overflows"))?;
-        Self::open(StoreConfig {
-            path,
-            size_bytes,
-            cache_bytes,
-            log_bytes: Some(superblock.log_bytes),
-            compress: superblock.compressed(),
-            create: false,
-        })
+        config.log_bytes = Some(superblock.log_bytes);
+        config.compress = superblock.compressed();
+        config.create = false;
+        Self::open(config)
     }
 
     /// Logical capacity in 4 KiB pages.
@@ -374,6 +614,8 @@ impl Store {
     pub fn info(&self) -> StoreInfo {
         let writer = self.writer.lock();
         let pages_on_disk = self.index.read().len();
+        let status = self.io.status();
+        let target = self.coalescer.lock().target_bytes();
         StoreInfo {
             path: self.config.path.clone(),
             capacity_bytes: self.capacity_bytes,
@@ -386,6 +628,15 @@ impl Store {
             compressed: self.compress,
             pages_on_disk,
             superblock_slot: writer.superblock_slot,
+            io_mode: status.mode,
+            io_direct: status.direct,
+            io_sqpoll: status.sqpoll,
+            hugepages_requested: self.config.hugepages,
+            hugepages_active: hugepages_active(),
+            coalesce_target_bytes: target,
+            coalesce_enabled: self.config.coalesce,
+            coalesce_min_bytes: self.config.coalesce_min_bytes,
+            coalesce_max_bytes: self.config.coalesce_max_bytes,
         }
     }
 
@@ -451,10 +702,10 @@ fn superblock_file_valid(path: &Path) -> bool {
     if len < DATA_OFFSET {
         return false;
     }
-    load_best_superblock(&file, len).is_ok()
+    load_best_superblock(&file, &Io::new(IoMode::Portable, false), len).is_ok()
 }
 
-fn load_best_superblock(file: &File, len: u64) -> Result<(Superblock, usize)> {
+fn load_best_superblock(file: &File, io: &Io, len: u64) -> Result<(Superblock, usize)> {
     let mut best: Option<(Superblock, usize)> = None;
     for slot in 0..SUPERBLOCK_SLOTS {
         let offset = slot * SUPERBLOCK_SIZE as u64;
@@ -462,7 +713,7 @@ fn load_best_superblock(file: &File, len: u64) -> Result<(Superblock, usize)> {
             continue;
         }
         let mut buffer = [0u8; SUPERBLOCK_SIZE];
-        if read_exact_at(file, &mut buffer, offset).is_err() {
+        if io.read_exact_at(file, &mut buffer, offset).is_err() {
             continue;
         }
         let Ok(superblock) = Superblock::decode(&buffer) else {
@@ -480,7 +731,7 @@ fn load_best_superblock(file: &File, len: u64) -> Result<(Superblock, usize)> {
     best.ok_or_else(|| Error::corrupt("no valid superblock found"))
 }
 
-fn scan_log(file: &File, superblock: &Superblock) -> Result<(HashMap<u64, Extent>, u64)> {
+fn scan_log(file: &File, io: &Io, superblock: &Superblock) -> Result<(HashMap<u64, Extent>, u64)> {
     let limit = DATA_OFFSET + superblock.log_bytes;
     let file_len = file.metadata()?.len();
     let scan_end = file_len.min(limit);
@@ -489,7 +740,10 @@ fn scan_log(file: &File, superblock: &Superblock) -> Result<(HashMap<u64, Extent
 
     while offset + RECORD_HEADER_SIZE as u64 <= scan_end {
         let mut header_buffer = [0u8; RECORD_HEADER_SIZE];
-        if read_exact_at(file, &mut header_buffer, offset).is_err() {
+        if io
+            .read_exact_at(file, &mut header_buffer, offset)
+            .is_err()
+        {
             break;
         }
         if header_buffer.iter().all(|byte| *byte == 0) {
@@ -509,7 +763,10 @@ fn scan_log(file: &File, superblock: &Superblock) -> Result<(HashMap<u64, Extent
             break;
         }
         let mut payload = vec![0u8; header.stored_len as usize];
-        if read_exact_at(file, &mut payload, offset + RECORD_HEADER_SIZE as u64).is_err() {
+        if io
+            .read_exact_at(file, &mut payload, offset + RECORD_HEADER_SIZE as u64)
+            .is_err()
+        {
             break;
         }
         if crc32c::crc32c(&payload) != header.payload_crc {
@@ -635,7 +892,7 @@ impl Store {
         Ok(())
     }
 
-    fn load_page_data(&self, page_no: u64) -> Result<(Box<AlignedPage>, u64)> {
+    fn load_page_data(&self, page_no: u64) -> Result<(PageHandle, u64)> {
         // Take the file lock before the index lock. Compaction takes them in
         // the same order, so an extent read here cannot refer to a file that
         // has already been renamed away.
@@ -646,7 +903,7 @@ impl Store {
             index.get(&page_no).copied()
         };
         let Some(extent) = extent else {
-            return Ok((AlignedPage::zeroed(), 0));
+            return Ok((PageHandle::zeroed(), 0));
         };
         if extent.offset < DATA_OFFSET
             || extent.offset + extent.record_len() > DATA_OFFSET + self.log_bytes
@@ -656,12 +913,14 @@ impl Store {
             )));
         }
         let mut header_buffer = [0u8; RECORD_HEADER_SIZE];
-        read_exact_at(file, &mut header_buffer, extent.offset).map_err(|error| {
-            Error::corrupt(format!(
-                "reading record header at {}: {error}",
-                extent.offset
-            ))
-        })?;
+        self.io
+            .read_exact_at(file, &mut header_buffer, extent.offset)
+            .map_err(|error| {
+                Error::corrupt(format!(
+                    "reading record header at {}: {error}",
+                    extent.offset
+                ))
+            })?;
         let header = RecordHeader::decode(&header_buffer)?;
         if header.page_no != page_no
             || header.generation != extent.generation
@@ -675,17 +934,18 @@ impl Store {
         }
         let stored = header.stored_len as usize;
         let payload_offset = extent.offset + RECORD_HEADER_SIZE as u64;
-        let mut data = AlignedPage::zeroed();
+        let mut data = PageHandle::zeroed_with(self.config.hugepages);
         if header.is_compressed() {
             let mut payload = [0u8; MAX_STORED_LEN];
-            read_exact_at(file, &mut payload[..stored], payload_offset)?;
+            self.io
+                .read_exact_at(file, &mut payload[..stored], payload_offset)?;
             if crc32c::crc32c(&payload[..stored]) != header.payload_crc {
                 return Err(Error::corrupt(format!(
                     "payload checksum mismatch at {}",
                     extent.offset
                 )));
             }
-            let written = lz4_flex::block::decompress_into(&payload[..stored], &mut data.0[..])
+            let written = lz4_flex::block::decompress_into(&payload[..stored], &mut data[..])
                 .map_err(|error| Error::Compression(format!("{error:?}")))?;
             if written != PAGE_SIZE {
                 return Err(Error::corrupt(format!(
@@ -698,11 +958,13 @@ impl Store {
                     "page {page_no} has {stored} stored bytes"
                 )));
             }
-            // Read the payload straight into the aligned cache page. This is
-            // the zero-bounce-buffer path: one kernel copy, no intermediate
-            // userspace allocation.
-            read_exact_at(file, &mut data.0, payload_offset)?;
-            if crc32c::crc32c(&data.0) != header.payload_crc {
+            // Read the payload straight into the aligned cache page. The
+            // portable backend performs one kernel copy with no intermediate
+            // userspace allocation; direct and asynchronous backends bounce
+            // through their own sector-aligned transfer buffer.
+            self.io
+                .read_exact_at(file, &mut data[..], payload_offset)?;
+            if crc32c::crc32c(&data[..]) != header.payload_crc {
                 return Err(Error::corrupt(format!(
                     "payload checksum mismatch at {}",
                     extent.offset
@@ -723,7 +985,7 @@ impl Store {
                 let mut shard = self.cache.shard_for(page_no).lock.write();
                 if let Some(page) = shard.pages.get_mut(&page_no) {
                     let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
-                    page.data.0.copy_from_slice(data);
+                    page.data[..].copy_from_slice(data);
                     page.dirty = true;
                     page.referenced.store(true, Ordering::Relaxed);
                     page.generation = generation;
@@ -732,7 +994,7 @@ impl Store {
                 if shard.pages.len() < shard.capacity {
                     let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
                     let mut buffer = shard.acquire();
-                    buffer.0.copy_from_slice(data);
+                    buffer[..].copy_from_slice(data);
                     shard.insert(page_no, CachePage::new(buffer, generation, true));
                     return Ok(());
                 }
@@ -765,7 +1027,7 @@ impl Store {
                 let mut shard = self.cache.shard_for(page_no).lock.write();
                 if let Some(page) = shard.pages.get_mut(&page_no) {
                     let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
-                    modify(&mut page.data.0[page_offset..end]);
+                    modify(&mut page.data[page_offset..end]);
                     page.dirty = true;
                     page.referenced.store(true, Ordering::Relaxed);
                     page.generation = generation;
@@ -781,7 +1043,7 @@ impl Store {
             // Cold path. Keep the loaded page across make_space retries so a
             // full shard does not force a second cold read.
             let (mut page, mut generation) = self.load_page_data(page_no)?;
-            modify(&mut page.0[page_offset..end]);
+            modify(&mut page[page_offset..end]);
             loop {
                 // Validate freshness under the index read lock, then apply the
                 // modification to whichever page is newest.
@@ -790,14 +1052,14 @@ impl Store {
                 if current != generation {
                     drop(index);
                     (page, generation) = self.load_page_data(page_no)?;
-                    modify(&mut page.0[page_offset..end]);
+                    modify(&mut page[page_offset..end]);
                     continue;
                 }
                 let mut shard = self.cache.shard_for(page_no).lock.write();
                 if shard.pages.contains_key(&page_no) {
                     let new_generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
                     let cached = shard.pages.get_mut(&page_no).expect("page is present");
-                    modify(&mut cached.data.0[page_offset..end]);
+                    modify(&mut cached.data[page_offset..end]);
                     cached.dirty = true;
                     cached.referenced.store(true, Ordering::Relaxed);
                     cached.generation = new_generation;
@@ -821,7 +1083,7 @@ impl Store {
         &self,
         page_no: u64,
         generation: u64,
-        page: Box<AlignedPage>,
+        page: PageHandle,
         page_offset: usize,
         target: &mut [u8],
     ) -> Result<CleanPublish> {
@@ -858,7 +1120,7 @@ impl Store {
                 }
                 continue;
             }
-            target.copy_from_slice(&page.0[page_offset..page_offset + target.len()]);
+            target.copy_from_slice(&page[page_offset..page_offset + target.len()]);
             shard.insert(page_no, CachePage::new(page, generation, false));
             return Ok(CleanPublish::Written);
         }
@@ -889,7 +1151,7 @@ impl Store {
             let Some((victim_no, data, generation)) = snapshot else {
                 return Err(Error::CacheFull);
             };
-            self.spill_page(victim_no, &data.0, generation)?;
+            self.spill_page(victim_no, &data[..], generation)?;
             Metrics::inc(&self.metrics.evictions_dirty);
 
             let removed = {
@@ -943,13 +1205,13 @@ enum CleanPublish {
     Retry,
 }
 
-fn read_record(file: &File, offset: u64) -> Result<(RecordHeader, Vec<u8>)> {
+fn read_record(file: &File, io: &Io, offset: u64) -> Result<(RecordHeader, Vec<u8>)> {
     let mut header_buffer = [0u8; RECORD_HEADER_SIZE];
-    read_exact_at(file, &mut header_buffer, offset)
+    io.read_exact_at(file, &mut header_buffer, offset)
         .map_err(|error| Error::corrupt(format!("reading record header at {offset}: {error}")))?;
     let header = RecordHeader::decode(&header_buffer)?;
     let mut payload = vec![0u8; header.stored_len as usize];
-    read_exact_at(file, &mut payload, offset + RECORD_HEADER_SIZE as u64)
+    io.read_exact_at(file, &mut payload, offset + RECORD_HEADER_SIZE as u64)
         .map_err(|error| Error::corrupt(format!("reading record payload at {offset}: {error}")))?;
     if crc32c::crc32c(&payload) != header.payload_crc {
         return Err(Error::corrupt(format!(
@@ -974,12 +1236,17 @@ impl Store {
 
         loop {
             let mut batch: Vec<DirtyPage> = Vec::new();
+            let target_pages = self
+                .coalescer
+                .lock()
+                .batch_pages()
+                .min(self.coalesce_batch_limit);
             'shards: for shard in self.cache.shards() {
                 let guard = shard.lock.read();
                 for (page_no, page) in &guard.pages {
                     if page.dirty && page.generation < mark {
-                        batch.push((*page_no, page.data.clone(), page.generation));
-                        if batch.len() >= MAX_FLUSH_BATCH {
+                        batch.push((*page_no, page.data.copy(), page.generation));
+                        if batch.len() >= target_pages {
                             break 'shards;
                         }
                     }
@@ -991,7 +1258,7 @@ impl Store {
 
             let references: Vec<PageWrite<'_>> = batch
                 .iter()
-                .map(|(page_no, data, generation)| (*page_no, &data.0[..], *generation))
+                .map(|(page_no, data, generation)| (*page_no, &data[..], *generation))
                 .collect();
             let extents = self.append_pages(&references)?;
             if extents.len() != batch.len() {
@@ -1061,7 +1328,7 @@ impl Store {
                     "page {page_no} has an invalid extent"
                 )));
             }
-            let (header, payload) = read_record(file, extent.offset)?;
+            let (header, payload) = read_record(file, &self.io, extent.offset)?;
             if header.page_no != page_no
                 || header.generation != extent.generation
                 || header.epoch != epoch
@@ -1192,10 +1459,15 @@ impl Store {
 
         // One positioned write for the entire batch. This is the access
         // pattern flash controllers handle best and removes one syscall per
-        // page from the flush path.
-        write_all_at(file, &batch, writer.head)?;
+        // page from the flush path. The coalescer learns from the observed
+        // latency of these batches.
+        let started = std::time::Instant::now();
+        self.io.write_all_at(file, &batch, writer.head)?;
         writer.head += batch.len() as u64;
         file.sync_data()?;
+        self.coalescer
+            .lock()
+            .observe(batch.len() as u64, started.elapsed());
         if let Err(error) = self.checkpoint_locked(&mut writer, file) {
             writer.needs_checkpoint = true;
             return Err(error);
@@ -1242,7 +1514,7 @@ impl Store {
             generation,
             self.compress,
         );
-        write_all_at(
+        self.io.write_all_at(
             file,
             &superblock.encode(),
             target as u64 * SUPERBLOCK_SIZE as u64,
@@ -1264,11 +1536,7 @@ impl Store {
             .collect();
 
         let compact_path = sidecar(&self.config.path, ".compact");
-        let compact = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&compact_path)?;
+        let compact = self.io.open(&compact_path, OpenSpec::CREATE)?;
 
         let new_epoch = writer
             .epoch
@@ -1292,7 +1560,8 @@ impl Store {
                 )));
             }
             let mut header_buffer = [0u8; RECORD_HEADER_SIZE];
-            read_exact_at(&old_file, &mut header_buffer, extent.offset)?;
+            self.io
+                .read_exact_at(&old_file, &mut header_buffer, extent.offset)?;
             let header = RecordHeader::decode(&header_buffer)?;
             if header.page_no != page_no
                 || header.generation != extent.generation
@@ -1304,7 +1573,7 @@ impl Store {
                 )));
             }
             payload.resize(header.stored_len as usize, 0);
-            read_exact_at(
+            self.io.read_exact_at(
                 &old_file,
                 &mut payload,
                 extent.offset + RECORD_HEADER_SIZE as u64,
@@ -1353,15 +1622,22 @@ impl Store {
                 },
             );
             if batch.len() >= COMPACT_BATCH_BYTES {
-                write_all_at(&compact, &batch, new_head)?;
+                self.io.write_all_at(&compact, &batch, new_head)?;
                 new_head += batch.len() as u64;
                 batch.clear();
             }
         }
         if !batch.is_empty() {
-            write_all_at(&compact, &batch, new_head)?;
+            self.io.write_all_at(&compact, &batch, new_head)?;
             new_head += batch.len() as u64;
             batch.clear();
+        }
+        if self.io.status().direct {
+            // Direct backends read whole sectors around every record. Extend
+            // the freshly compacted file so the last record's sector run is
+            // inside the file; the recovery scan stops at the first all-zero
+            // header, so the padding is invisible.
+            compact.set_len(align_up(new_head, PAGE_SIZE as u64))?;
         }
 
         compact.sync_all()?;
@@ -1373,8 +1649,13 @@ impl Store {
             new_generation,
             self.compress,
         );
-        write_all_at(&compact, &superblock.encode(), 0)?;
-        write_all_at(&compact, &[0u8; SUPERBLOCK_SIZE], SUPERBLOCK_SIZE as u64)?;
+        self.io
+            .write_all_at(&compact, &superblock.encode(), 0)?;
+        self.io.write_all_at(
+            &compact,
+            &[0u8; SUPERBLOCK_SIZE],
+            SUPERBLOCK_SIZE as u64,
+        )?;
         compact.sync_all()?;
         drop(compact);
         drop(old_file);
@@ -1386,31 +1667,20 @@ impl Store {
         let old_path = sidecar(&self.config.path, ".old");
         let _ = std::fs::remove_file(&old_path);
         if let Err(error) = std::fs::rename(&self.config.path, &old_path) {
-            if let Ok(reopened) = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&self.config.path)
-            {
+            if let Ok(reopened) = self.io.open(&self.config.path, OpenSpec::READ_WRITE) {
                 *file_guard = Some(reopened);
             }
             return Err(error.into());
         }
         if let Err(error) = std::fs::rename(&compact_path, &self.config.path) {
             let _ = std::fs::rename(&old_path, &self.config.path);
-            if let Ok(reopened) = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&self.config.path)
-            {
+            if let Ok(reopened) = self.io.open(&self.config.path, OpenSpec::READ_WRITE) {
                 *file_guard = Some(reopened);
             }
             return Err(error.into());
         }
         let _ = std::fs::remove_file(&old_path);
-        let new_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.config.path)?;
+        let new_file = self.io.open(&self.config.path, OpenSpec::READ_WRITE)?;
         *file_guard = Some(new_file);
 
         *self.index.write() = new_index;

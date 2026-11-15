@@ -7,9 +7,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use usbasram_core::{Store, StoreConfig, StoreInfo};
+use usbasram_core::{IoMode, Store, StoreConfig, StoreInfo};
 
 use crate::bench::BenchOptions;
 use crate::size::{human_bytes, parse_size};
@@ -60,6 +60,8 @@ struct InitArgs {
     /// Delete an existing store and its sidecar files first.
     #[arg(long)]
     force: bool,
+    #[command(flatten)]
+    engine: EngineArgs,
 }
 
 #[derive(Args, Debug)]
@@ -69,6 +71,8 @@ struct OpenArgs {
     /// RAM cache to use for metadata operations.
     #[arg(long, default_value = "64M")]
     cache: String,
+    #[command(flatten)]
+    engine: EngineArgs,
 }
 
 #[derive(Args, Debug)]
@@ -90,6 +94,8 @@ struct ServeArgs {
     /// Flush dirty pages every N seconds (0 disables the background flusher).
     #[arg(long, default_value_t = 5)]
     flush_interval: u64,
+    #[command(flatten)]
+    engine: EngineArgs,
 }
 
 #[derive(Args, Debug)]
@@ -103,6 +109,9 @@ struct BenchArgs {
     /// Number of benchmark threads.
     #[arg(long, default_value_t = 4)]
     threads: usize,
+    /// Queue-depth levels to test (comma separated).
+    #[arg(long, default_value = "1,4,16,64")]
+    queue_depths: String,
     /// Duration of each phase in seconds.
     #[arg(long, default_value_t = 2.0)]
     seconds: f64,
@@ -112,6 +121,52 @@ struct BenchArgs {
     /// Print machine-readable JSON.
     #[arg(long)]
     json: bool,
+    #[command(flatten)]
+    engine: EngineArgs,
+}
+
+/// I/O and memory tuning shared by every command that opens a store.
+#[derive(Args, Debug, Clone)]
+struct EngineArgs {
+    /// Positioned I/O engine: portable, direct, uring, or iocp.
+    #[arg(long, default_value = "portable")]
+    io: String,
+    /// Try large pages for the hot cache and transfer buffers.
+    #[arg(long)]
+    hugepages: bool,
+    /// Disable adaptive sequential write coalescing.
+    #[arg(long)]
+    no_coalesce: bool,
+    /// Smallest coalescing window.
+    #[arg(long, default_value = "128K")]
+    coalesce_min: String,
+    /// Largest coalescing window.
+    #[arg(long, default_value = "4M")]
+    coalesce_max: String,
+    /// Device erase-block granularity used to round coalescing windows.
+    #[arg(long, default_value = "128K")]
+    erase_block: String,
+}
+
+impl EngineArgs {
+    fn apply(&self, config: StoreConfig) -> Result<StoreConfig> {
+        let mode = match self.io.to_ascii_lowercase().as_str() {
+            "portable" => IoMode::Portable,
+            "direct" => IoMode::Direct,
+            "uring" | "io_uring" => IoMode::Uring,
+            "iocp" => IoMode::Iocp,
+            other => bail!("unknown I/O engine {other:?}; use portable, direct, uring, or iocp"),
+        };
+        Ok(config
+            .with_io_mode(mode)
+            .with_hugepages(self.hugepages)
+            .with_coalescing(
+                !self.no_coalesce,
+                parse_size(&self.coalesce_min)?,
+                parse_size(&self.coalesce_max)?,
+                parse_size(&self.erase_block)?,
+            ))
+    }
 }
 
 fn main() {
@@ -148,6 +203,7 @@ fn init(args: InitArgs) -> Result<()> {
     if let Some(log_size) = args.log_size {
         config = config.with_log_bytes(parse_size(&log_size)?);
     }
+    let config = args.engine.apply(config)?;
     let store = Store::open(config)
         .with_context(|| format!("creating store at {}", args.path.display()))?;
     store.flush()?;
@@ -187,12 +243,16 @@ fn compact(args: OpenArgs) -> Result<()> {
 
 fn serve(args: ServeArgs) -> Result<()> {
     let cache = parse_size(&args.cache)?;
+    let requested = args.engine.apply(StoreConfig::new(&args.path, 0))?;
     let store = if let Some(size) = &args.size {
         let size = parse_size(size)?;
-        Store::open(StoreConfig::new(&args.path, size).with_cache_bytes(cache))
+        let config = StoreConfig::new(&args.path, size).with_cache_bytes(cache);
+        let config = args.engine.apply(config)?;
+        Store::open(config)
             .with_context(|| format!("opening or creating {}", args.path.display()))?
     } else {
-        Store::open_existing(&args.path, cache)
+        let config = requested.with_cache_bytes(cache);
+        Store::open_existing_with(config)
             .with_context(|| format!("opening {}", args.path.display()))?
     };
     let store = Arc::new(store);
@@ -229,18 +289,40 @@ fn serve(args: ServeArgs) -> Result<()> {
 
 fn run_bench(args: BenchArgs) -> Result<()> {
     let seconds = if args.quick { 0.5 } else { args.seconds };
+    let queue_depths = args
+        .queue_depths
+        .split(',')
+        .map(|value| value.trim().parse::<usize>())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("queue depths must be a comma-separated list of positive integers")?;
+    if queue_depths.is_empty() || queue_depths.contains(&0) {
+        bail!("queue depths must be positive");
+    }
+    let mut config = StoreConfig::new("bench.usr", parse_size(&args.size)?)
+        .with_cache_bytes(parse_size(&args.cold_cache)?);
+    config = args.engine.apply(config)?;
     bench::run(BenchOptions {
         size_bytes: parse_size(&args.size)?,
         cold_cache_bytes: parse_size(&args.cold_cache)?,
         threads: args.threads,
+        queue_depths,
         seconds,
         json: args.json,
+        io_mode: config.io_mode,
+        hugepages: config.hugepages,
+        coalesce: config.coalesce,
+        coalesce_min_bytes: config.coalesce_min_bytes,
+        coalesce_max_bytes: config.coalesce_max_bytes,
+        erase_block_bytes: config.erase_block_bytes,
     })
 }
 
 fn open_existing(args: &OpenArgs) -> Result<Store> {
     let cache = parse_size(&args.cache)?;
-    Store::open_existing(&args.path, cache)
+    let config = args
+        .engine
+        .apply(StoreConfig::new(&args.path, 0).with_cache_bytes(cache))?;
+    Store::open_existing_with(config)
         .with_context(|| format!("opening {}", args.path.display()))
 }
 
@@ -270,6 +352,38 @@ fn print_info(info: &StoreInfo) {
     println!(
         "  compression: {}",
         if info.compressed { "on" } else { "off" }
+    );
+    println!(
+        "  I/O engine: {}{}{}",
+        info.io_mode.as_str(),
+        if info.io_direct { " (direct)" } else { "" },
+        if info.io_sqpoll { " (SQPOLL)" } else { "" }
+    );
+    println!(
+        "  hugepages: {}{}",
+        if info.hugepages_requested {
+            "requested"
+        } else {
+            "off"
+        },
+        if info.hugepages_active {
+            ", active"
+        } else {
+            ""
+        }
+    );
+    println!(
+        "  coalescing: {}",
+        if info.coalesce_enabled {
+            format!(
+                "{} window (range {}..{})",
+                human_bytes(info.coalesce_target_bytes),
+                human_bytes(info.coalesce_min_bytes),
+                human_bytes(info.coalesce_max_bytes)
+            )
+        } else {
+            "off".to_string()
+        }
     );
 }
 

@@ -18,3 +18,11 @@ clap.workspace = true
 tempfile = "3"
 usbasram-core.workspace = true
 usbasram-nbd.workspace = true
+
+[features]
+default = []
+direct-io = ["usbasram-core/direct-io"]
+hugepages = ["usbasram-core/hugepages"]
+io-uring = ["usbasram-core/io-uring"]
+iocp = ["usbasram-core/iocp"]
+hardware = ["direct-io", "hugepages", "io-uring", "iocp"]

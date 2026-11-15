@@ -3,32 +3,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::RwLock;
 
+use crate::mem::PageHandle;
 use crate::PAGE_SIZE;
 
-/// A 4 KiB-aligned page buffer.
-///
-/// The alignment means a page never straddles a 4 KiB boundary, so cold reads
-/// can be issued straight into the cache page without a bounce buffer and the
-/// buffer is suitable for direct/vectored I/O.
-#[repr(C, align(4096))]
-#[derive(Clone)]
-pub(crate) struct AlignedPage(pub [u8; PAGE_SIZE]);
-
-impl AlignedPage {
-    pub(crate) fn zeroed() -> Box<Self> {
-        Box::new(Self([0u8; PAGE_SIZE]))
-    }
-}
-
 pub(crate) struct CachePage {
-    pub data: Box<AlignedPage>,
+    pub data: PageHandle,
     pub dirty: bool,
     pub referenced: AtomicBool,
     pub generation: u64,
 }
 
 impl CachePage {
-    pub(crate) fn new(data: Box<AlignedPage>, generation: u64, dirty: bool) -> Self {
+    pub(crate) fn new(data: PageHandle, generation: u64, dirty: bool) -> Self {
         Self {
             data,
             dirty,
@@ -49,9 +35,9 @@ pub(crate) struct ShardSlot {
 }
 
 impl ShardSlot {
-    pub(crate) fn new(capacity: usize) -> Self {
+    pub(crate) fn new(capacity: usize, hugepages: bool) -> Self {
         Self {
-            lock: RwLock::new(Shard::new(capacity)),
+            lock: RwLock::new(Shard::new(capacity, hugepages)),
         }
     }
 }
@@ -61,17 +47,18 @@ impl ShardSlot {
 pub(crate) struct Shard {
     pub pages: HashMap<u64, CachePage>,
     clock: Vec<u64>,
-    free: Vec<Box<AlignedPage>>,
+    free: Vec<PageHandle>,
     hand: usize,
     pub capacity: usize,
+    hugepages: bool,
 }
 
 /// A copy of a dirty page, safe to compress and append without holding a shard
 /// lock. The page remains visible in the cache until the append commits.
-pub(crate) type DirtySnapshot = (u64, Box<AlignedPage>, u64);
+pub(crate) type DirtySnapshot = (u64, PageHandle, u64);
 
 impl Shard {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, hugepages: bool) -> Self {
         let reserve = capacity.min(1024);
         Self {
             pages: HashMap::with_capacity(reserve),
@@ -79,16 +66,19 @@ impl Shard {
             free: Vec::new(),
             hand: 0,
             capacity,
+            hugepages,
         }
     }
 
     /// Take a page buffer from the free list, or allocate a new aligned page.
-    pub(crate) fn acquire(&mut self) -> Box<AlignedPage> {
-        self.free.pop().unwrap_or_else(AlignedPage::zeroed)
+    pub(crate) fn acquire(&mut self) -> PageHandle {
+        self.free
+            .pop()
+            .unwrap_or_else(|| PageHandle::zeroed_with(self.hugepages))
     }
 
     /// Return an unused page buffer to the shard.
-    pub(crate) fn recycle(&mut self, page: Box<AlignedPage>) {
+    pub(crate) fn recycle(&mut self, page: PageHandle) {
         if self.free.len() < self.capacity {
             self.free.push(page);
         }
@@ -191,7 +181,7 @@ impl Shard {
                 // Advance the hand so a page that is being written continuously
                 // cannot monopolize spill selection and starve other dirty pages.
                 self.hand = (index + 1) % self.clock.len();
-                return Some((page_no, Box::new(AlignedPage(page.data.0)), page.generation));
+                return Some((page_no, page.data.copy(), page.generation));
             }
         }
         None
@@ -225,7 +215,7 @@ pub(crate) struct PageCache {
 }
 
 impl PageCache {
-    pub(crate) fn new(cache_pages: usize) -> Self {
+    pub(crate) fn new(cache_pages: usize, hugepages: bool) -> Self {
         let cache_pages = cache_pages.max(1);
         let target = (cache_pages / 128).clamp(1, 256).next_power_of_two();
         let shard_count = target.min(cache_pages).max(1);
@@ -234,7 +224,7 @@ impl PageCache {
         let shards = (0..shard_count)
             .map(|index| {
                 let extra_page = if index < extra { 1 } else { 0 };
-                ShardSlot::new(base + extra_page)
+                ShardSlot::new(base + extra_page, hugepages)
             })
             .collect();
         Self {
@@ -258,7 +248,7 @@ impl PageCache {
             return false;
         };
         page.referenced.store(true, Ordering::Relaxed);
-        dst.copy_from_slice(&page.data.0[page_offset..page_offset + dst.len()]);
+        dst.copy_from_slice(&page.data[page_offset..page_offset + dst.len()]);
         true
     }
 
@@ -278,20 +268,20 @@ impl PageCache {
 mod tests {
     use super::*;
 
-    fn page(byte: u8) -> Box<AlignedPage> {
-        let mut buffer = AlignedPage::zeroed();
-        buffer.0.fill(byte);
+    fn page(byte: u8) -> PageHandle {
+        let mut buffer = PageHandle::zeroed();
+        buffer[..].fill(byte);
         buffer
     }
 
     #[test]
     fn cache_evicts_a_clean_page_when_full() {
-        let mut shard = Shard::new(2);
+        let mut shard = Shard::new(2, false);
         for page_no in 0..2 {
             shard.insert(page_no, CachePage::new(page(page_no as u8), 1, false));
         }
         let victim = shard.evict_clean().expect("victim");
-        assert_eq!(victim.data.0[0], 0);
+        assert_eq!(victim.data[0], 0);
         assert_eq!(shard.pages.len(), 1);
         shard.insert(9, CachePage::new(page(9), 1, false));
         assert_eq!(shard.pages.len(), 2);
@@ -299,7 +289,7 @@ mod tests {
 
     #[test]
     fn second_chance_protects_referenced_pages() {
-        let mut shard = Shard::new(2);
+        let mut shard = Shard::new(2, false);
         for page_no in 0..2 {
             shard.insert(page_no, CachePage::new(page(0), 1, false));
         }
@@ -311,20 +301,20 @@ mod tests {
 
     #[test]
     fn dirty_pages_are_not_evicted_without_a_spill() {
-        let mut shard = Shard::new(2);
+        let mut shard = Shard::new(2, false);
         shard.insert(0, CachePage::new(page(7), 3, true));
         assert!(shard.evict_clean().is_none());
         assert_eq!(shard.pages.len(), 1);
         let (page_no, snapshot, generation) = shard.dirty_snapshot().expect("snapshot");
         assert_eq!(page_no, 0);
-        assert_eq!(snapshot.0[0], 7);
+        assert_eq!(snapshot[0], 7);
         assert_eq!(generation, 3);
         assert_eq!(shard.pages.len(), 1);
     }
 
     #[test]
     fn spill_selection_advances_the_clock_hand() {
-        let mut shard = Shard::new(4);
+        let mut shard = Shard::new(4, false);
         shard.insert(0, CachePage::new(page(1), 1, true));
         shard.insert(1, CachePage::new(page(2), 2, true));
         let first = shard.dirty_snapshot().expect("first victim");
@@ -335,6 +325,7 @@ mod tests {
     #[test]
     fn shards_are_cache_line_padded() {
         assert_eq!(std::mem::align_of::<ShardSlot>(), 128);
-        assert_eq!(std::mem::align_of::<AlignedPage>(), 4096);
+        let page = PageHandle::zeroed();
+        assert_eq!(page.as_ptr() as usize % PAGE_SIZE, 0);
     }
 }

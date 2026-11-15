@@ -33,18 +33,31 @@
 //! # Ok(())
 //! # }
 //! ```
-#![forbid(unsafe_code)]
+#![cfg_attr(
+    not(any(
+        feature = "direct-io",
+        feature = "hugepages",
+        feature = "io-uring",
+        feature = "iocp"
+    )),
+    forbid(unsafe_code)
+)]
+#![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_debug_implementations)]
 
 mod cache;
 mod format;
 mod io;
+mod mem;
 mod metrics;
+pub mod raw;
 mod store;
 
 pub mod error;
 
 pub use error::{Error, Result};
+pub use io::{IoMode, IoStatus};
+pub use mem::{hugepages_active, hugepages_supported};
 pub use metrics::Stats;
 pub use store::{min_log_bytes, Store, StoreConfig, StoreInfo, VerifyReport};
 

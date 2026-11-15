@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -15,8 +15,8 @@ repository = "https://github.com/Jonah-Joshua/UsbAsRam-Project"
 authors = ["Jonah Joshua and contributors"]
 
 [workspace.dependencies]
-usbasram-core = { path = "crates/usbasram-core", version = "1.1.0" }
-usbasram-nbd = { path = "crates/usbasram-nbd", version = "1.1.0" }
+usbasram-core = { path = "crates/usbasram-core", version = "1.2.0" }
+usbasram-nbd = { path = "crates/usbasram-nbd", version = "1.2.0" }
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 crc32c = "0.6"

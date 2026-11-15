@@ -38,7 +38,7 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --workspace --release --locked --target ${{ matrix.target }}
+        run: cargo build -p usbasram-cli --release --locked --target ${{ matrix.target }} --features hardware
       - name: Stage binary
         shell: bash
         run: |
@@ -78,7 +78,10 @@ jobs:
             device. The NBD server exposes the store as a standard block device.
 
             This release includes standalone binaries for Linux, Windows, and
-            macOS (Apple Silicon), plus SHA-256 checksums.
+            macOS (Apple Silicon), plus SHA-256 checksums. The binaries carry
+            the optional `direct-io`, `hugepages`, `io-uring`, and `iocp`
+            backends; portable I/O remains the default and every optional
+            backend falls back cleanly and reports the effective mode.
 
             **Important:** USB storage cannot be faster than DDR3. This project
             keeps the hot set in RAM and makes the cold tier durable and

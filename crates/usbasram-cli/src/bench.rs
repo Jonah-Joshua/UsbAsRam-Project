@@ -3,7 +3,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
-use usbasram_core::{Store, StoreConfig, PAGE_SIZE};
+use usbasram_core::{raw, IoMode, Store, StoreConfig, PAGE_SIZE};
 
 use crate::size::human_bytes;
 
@@ -11,12 +11,20 @@ pub struct BenchOptions {
     pub size_bytes: u64,
     pub cold_cache_bytes: u64,
     pub threads: usize,
+    pub queue_depths: Vec<usize>,
     pub seconds: f64,
     pub json: bool,
+    pub io_mode: IoMode,
+    pub hugepages: bool,
+    pub coalesce: bool,
+    pub coalesce_min_bytes: u64,
+    pub coalesce_max_bytes: u64,
+    pub erase_block_bytes: u64,
 }
 
 struct Phase {
     name: &'static str,
+    queue_depth: usize,
     ops: u64,
     bytes: u64,
     elapsed: Duration,
@@ -36,9 +44,30 @@ impl Phase {
     }
 }
 
+struct Latency {
+    p50: u64,
+    p99: u64,
+    p999: u64,
+}
+
+impl Latency {
+    fn empty() -> Self {
+        Self {
+            p50: 0,
+            p99: 0,
+            p999: 0,
+        }
+    }
+}
+
 pub fn run(options: BenchOptions) -> Result<()> {
-    if options.threads == 0 {
-        bail!("--threads must be greater than zero");
+    let queue_depths = if options.queue_depths.is_empty() {
+        vec![options.threads.max(1)]
+    } else {
+        options.queue_depths.clone()
+    };
+    if queue_depths.iter().any(|depth| *depth == 0 || *depth > 1024) {
+        bail!("--queue-depths values must be between 1 and 1024");
     }
     if options.seconds <= 0.0 {
         bail!("--seconds must be greater than zero");
@@ -50,72 +79,115 @@ pub fn run(options: BenchOptions) -> Result<()> {
     let cold_cache = options
         .cold_cache_bytes
         .clamp(PAGE_SIZE as u64, options.size_bytes);
+    let max_depth = queue_depths.iter().copied().max().unwrap_or(1);
 
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("bench.usr");
     let mut phases = Vec::new();
-    let (hot_p50_ns, hot_p99_ns);
+    let mut hot_latency = Latency::empty();
+    let mut cold_latency = Latency::empty();
+    let (effective_mode, effective_direct, effective_sqpoll, effective_hugepages);
 
     {
-        let store = Store::open(
-            StoreConfig::new(&path, options.size_bytes).with_cache_bytes(options.size_bytes),
-        )?;
+        let store = Store::open(tuned_config(
+            &path,
+            options.size_bytes,
+            options.size_bytes,
+            &options,
+        ))?;
+        let info = store.info();
+        effective_mode = info.io_mode;
+        effective_direct = info.io_direct;
+        effective_sqpoll = info.io_sqpoll;
+        effective_hugepages = info.hugepages_active;
         let fill = random_page(0x5eed_1234);
         for page in 0..pages {
             store.write_at(page * PAGE_SIZE as u64, &fill)?;
         }
         store.flush()?;
 
-        let started = Instant::now();
-        let (ops, bytes) = read_phase(&store, pages, options.threads, options.seconds);
-        phases.push(Phase {
-            name: "hot_read",
-            ops,
-            bytes,
-            elapsed: started.elapsed(),
-        });
-        let (p50_ns, p99_ns) = read_latency(&store, pages, 20_000);
-        hot_p50_ns = p50_ns;
-        hot_p99_ns = p99_ns;
+        for depth in &queue_depths {
+            let started = Instant::now();
+            let (ops, bytes) = read_phase(&store, pages, *depth, options.seconds);
+            phases.push(Phase {
+                name: "hot_read",
+                queue_depth: *depth,
+                ops,
+                bytes,
+                elapsed: started.elapsed(),
+            });
+        }
+        hot_latency = read_latency(&store, pages, 50_000);
 
-        let started = Instant::now();
-        let (ops, bytes) = write_phase(&store, pages, options.threads, options.seconds);
-        phases.push(Phase {
-            name: "hot_write",
-            ops,
-            bytes,
-            elapsed: started.elapsed(),
-        });
+        for depth in &queue_depths {
+            let started = Instant::now();
+            let (ops, bytes) = write_phase(&store, pages, *depth, options.seconds);
+            phases.push(Phase {
+                name: "hot_write",
+                queue_depth: *depth,
+                ops,
+                bytes,
+                elapsed: started.elapsed(),
+            });
+        }
         store.flush()?;
     }
 
     {
-        let store =
-            Store::open(StoreConfig::new(&path, options.size_bytes).with_cache_bytes(cold_cache))?;
+        let store = Store::open(tuned_config(&path, options.size_bytes, cold_cache, &options))?;
         let started = Instant::now();
-        let (ops, bytes) = read_phase(&store, pages, options.threads, options.seconds);
+        let (ops, bytes) = read_phase(&store, pages, max_depth, options.seconds);
         phases.push(Phase {
             name: "cold_read",
+            queue_depth: max_depth,
             ops,
             bytes,
             elapsed: started.elapsed(),
         });
+        cold_latency = read_latency(&store, pages, 20_000);
     }
+
+    let raw_bytes = (options.size_bytes.min(64 * 1024 * 1024)).max(4 * 1024 * 1024);
+    let raw_path = directory.path().join("raw.bin");
+    let raw_report = raw::run(&raw_path, options.io_mode, raw_bytes, options.hugepages)?;
+    phases.push(Phase {
+        name: "raw_write",
+        queue_depth: 1,
+        ops: raw_report.bytes / PAGE_SIZE as u64,
+        bytes: raw_report.bytes,
+        elapsed: Duration::from_secs_f64(raw_report.write_seconds),
+    });
+    phases.push(Phase {
+        name: "raw_read",
+        queue_depth: 1,
+        ops: raw_report.bytes / PAGE_SIZE as u64,
+        bytes: raw_report.bytes,
+        elapsed: Duration::from_secs_f64(raw_report.read_seconds),
+    });
 
     if options.json {
         println!(
-            "{{\"size_bytes\":{},\"hot_cache_bytes\":{},\"cold_cache_bytes\":{},\"threads\":{},\"hot_read_p50_ns\":{},\"hot_read_p99_ns\":{},\"phases\":[{}]}}",
+            "{{\"size_bytes\":{},\"hot_cache_bytes\":{},\"cold_cache_bytes\":{},\"io_mode\":\"{}\",\"io_direct\":{},\"io_sqpoll\":{},\"hugepages\":{},\"queue_depths\":[{}],\"hot_read_latency\":{},\"cold_read_latency\":{},\"phases\":[{}]}}",
             options.size_bytes,
             options.size_bytes,
             cold_cache,
-            options.threads,
-            hot_p50_ns,
-            hot_p99_ns,
+            effective_mode.as_str(),
+            effective_direct,
+            effective_sqpoll,
+            effective_hugepages,
+            queue_depths
+                .iter()
+                .map(|depth| depth.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            latency_json(&hot_latency),
+            latency_json(&cold_latency),
             phases
                 .iter()
                 .map(|phase| format!(
-                    "{{\"name\":\"{}\",\"ops\":{},\"bytes\":{},\"seconds\":{:.6},\"iops\":{:.1},\"gib_per_s\":{:.3}}}",
+                    "{{\"name\":\"{}\",\"queue_depth\":{},\"ops\":{},\"bytes\":{},\"seconds\":{:.6},\"iops\":{:.1},\"gib_per_s\":{:.3}}}",
                     phase.name,
+                    phase.queue_depth,
                     phase.ops,
                     phase.bytes,
                     phase.seconds(),
@@ -130,21 +202,34 @@ pub fn run(options: BenchOptions) -> Result<()> {
 
     println!("usbasram benchmark");
     println!(
-        "  logical size: {}, hot cache: {}, cold cache: {}, threads: {}",
+        "  logical size: {}, hot cache: {}, cold cache: {}",
         human_bytes(options.size_bytes),
         human_bytes(options.size_bytes),
-        human_bytes(cold_cache),
-        options.threads
+        human_bytes(cold_cache)
+    );
+    println!(
+        "  I/O engine: {}{}{}, hugepages: {}",
+        effective_mode.as_str(),
+        if effective_direct { " (direct)" } else { "" },
+        if effective_sqpoll { " (SQPOLL)" } else { "" },
+        if effective_hugepages {
+            "active"
+        } else if options.hugepages {
+            "requested (unavailable)"
+        } else {
+            "off"
+        }
     );
     println!();
     println!(
-        "  {:<12} {:>14} {:>14} {:>14}",
-        "phase", "ops", "IOPS", "throughput"
+        "  {:<12} {:>4} {:>14} {:>14} {:>16}",
+        "phase", "qd", "ops", "IOPS", "throughput"
     );
     for phase in &phases {
         println!(
-            "  {:<12} {:>14} {:>14.0} {:>14.2} GiB/s",
+            "  {:<12} {:>4} {:>14} {:>14.0} {:>13.2} GiB/s",
             phase.name,
+            phase.queue_depth,
             phase.ops,
             phase.ops_per_second(),
             phase.gib_per_second()
@@ -152,16 +237,45 @@ pub fn run(options: BenchOptions) -> Result<()> {
     }
     println!();
     println!(
-        "  hot read latency: p50 {} ns, p99 {} ns",
-        hot_p50_ns, hot_p99_ns
+        "  hot read latency: p50 {} ns, p99 {} ns, p99.9 {} ns",
+        hot_latency.p50, hot_latency.p99, hot_latency.p999
     );
     println!(
-        "  Note: hot phases are RAM-cache hits. cold_read is bounded by the backing file/device."
+        "  cold read latency: p50 {} ns, p99 {} ns, p99.9 {} ns",
+        cold_latency.p50, cold_latency.p99, cold_latency.p999
+    );
+    println!(
+        "  Note: hot phases are RAM-cache hits; raw phases bypass the store and measure the selected backend directly."
     );
     Ok(())
 }
 
-fn read_latency(store: &Store, pages: u64, samples: usize) -> (u64, u64) {
+fn tuned_config(
+    path: &std::path::Path,
+    size_bytes: u64,
+    cache_bytes: u64,
+    options: &BenchOptions,
+) -> StoreConfig {
+    StoreConfig::new(path, size_bytes)
+        .with_cache_bytes(cache_bytes)
+        .with_io_mode(options.io_mode)
+        .with_hugepages(options.hugepages)
+        .with_coalescing(
+            options.coalesce,
+            options.coalesce_min_bytes,
+            options.coalesce_max_bytes,
+            options.erase_block_bytes,
+        )
+}
+
+fn latency_json(latency: &Latency) -> String {
+    format!(
+        "{{\"p50_ns\":{},\"p99_ns\":{},\"p99_9_ns\":{}}}",
+        latency.p50, latency.p99, latency.p999
+    )
+}
+
+fn read_latency(store: &Store, pages: u64, samples: usize) -> Latency {
     let mut rng = Rng::new(0x1a7e_11ce);
     let mut buffer = [0u8; PAGE_SIZE];
     // Warm the cache path before recording.
@@ -181,11 +295,14 @@ fn read_latency(store: &Store, pages: u64, samples: usize) -> (u64, u64) {
     black_box(&buffer);
     timings.sort_unstable();
     if timings.is_empty() {
-        return (0, 0);
+        return Latency::empty();
     }
-    let p50 = timings[timings.len() / 2];
-    let p99 = timings[(timings.len() - 1) * 99 / 100];
-    (p50, p99)
+    let per_mille = |permille: usize| timings[(timings.len() - 1) * permille / 1000];
+    Latency {
+        p50: timings[timings.len() / 2],
+        p99: per_mille(990),
+        p999: per_mille(999),
+    }
 }
 
 fn read_phase(store: &Store, pages: u64, threads: usize, seconds: f64) -> (u64, u64) {
