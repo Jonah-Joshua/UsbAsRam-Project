@@ -811,7 +811,7 @@ mod iocp {
         use std::os::windows::ffi::OsStrExt;
         use std::os::windows::io::FromRawHandle;
         use windows_sys::Win32::Storage::FileSystem::{
-            CREATE_ALWAYS, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_NO_BUFFERING,
+            CreateFileW, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_NO_BUFFERING,
             FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
             GENERIC_READ, GENERIC_WRITE, OPEN_ALWAYS, OPEN_EXISTING,
         };
@@ -827,8 +827,7 @@ mod iocp {
         } else {
             OPEN_EXISTING
         };
-        let flags =
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED;
+        let flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED;
         // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives the call
         // and every other argument is a plain value.
         let handle = unsafe {
