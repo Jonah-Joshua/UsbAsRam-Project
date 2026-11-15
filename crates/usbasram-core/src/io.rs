@@ -661,11 +661,12 @@ mod iocp {
     use std::io;
     use std::mem::zeroed;
     use std::os::windows::io::AsRawHandle;
+    use std::path::Path;
     use std::ptr;
     use std::sync::Mutex;
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_IO_PENDING, HANDLE, INVALID_HANDLE_VALUE,
+        CloseHandle, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
     use windows_sys::Win32::System::IO::{
@@ -674,7 +675,7 @@ mod iocp {
 
     use crate::mem::AlignedBuffer;
 
-    use super::{aligned_span, Backend, File, IoMode, IoStatus, IO_ALIGNMENT};
+    use super::{aligned_span, Backend, File, IoMode, IoStatus, OpenSpec, IO_ALIGNMENT};
 
     const BUFFER_BYTES: usize = 4 * 1024 * 1024 + 64 * 1024;
     const INFINITE: u32 = u32::MAX;
@@ -812,8 +813,8 @@ mod iocp {
         use std::os::windows::io::FromRawHandle;
         use windows_sys::Win32::Storage::FileSystem::{
             CreateFileW, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_NO_BUFFERING,
-            FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            GENERIC_READ, GENERIC_WRITE, OPEN_ALWAYS, OPEN_EXISTING,
+            FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS,
+            OPEN_EXISTING,
         };
 
         let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
