@@ -268,11 +268,11 @@ impl HugePool {
             return Some(slot);
         }
         loop {
-            if let Some(chunk) = &state.current {
-                if state.next < HUGE_CHUNK_PAGES {
+            if state.next < HUGE_CHUNK_PAGES {
+                if let Some(chunk) = state.current.as_ref().map(Arc::clone) {
                     let index = state.next;
                     state.next += 1;
-                    return Some((Arc::clone(chunk), index));
+                    return Some((chunk, index));
                 }
             }
             let (chunk, huge) = HugeChunk::allocate(HUGE_CHUNK_BYTES)?;
