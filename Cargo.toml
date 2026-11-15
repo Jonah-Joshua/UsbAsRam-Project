@@ -13,7 +13,6 @@ rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Jonah-Joshua/UsbAsRam-Project"
 authors = ["Jonah Joshua and contributors"]
-description = "A crash-safe, tiered RAM + USB storage engine written in Rust."
 
 [workspace.dependencies]
 usbasram-core = { path = "crates/usbasram-core", version = "1.1.0" }

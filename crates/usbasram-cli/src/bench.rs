@@ -54,8 +54,7 @@ pub fn run(options: BenchOptions) -> Result<()> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("bench.usr");
     let mut phases = Vec::new();
-    let mut hot_p50_ns = 0u64;
-    let mut hot_p99_ns = 0u64;
+    let (hot_p50_ns, hot_p99_ns);
 
     {
         let store = Store::open(

@@ -50,11 +50,24 @@ cache, so `cold_read` here overstates what a real USB flash drive can do.
 - Phase duration: 0.5 s
 - Runner: `ubuntu-latest` (shared GitHub-hosted hardware)
 
+Run-to-run variance on shared runners is large enough that a few percent
+difference is noise. Compare changes only against runs on the same runner class.
+
 | Phase | Operations | IOPS | Throughput |
 | --- | ---: | ---: | ---: |
-| `hot_read` | 2,883,810 | 5,766,337 | 22.00 GiB/s |
-| `hot_write` | 2,999,948 | 5,998,607 | 22.88 GiB/s |
-| `cold_read` | 718,827 | 1,437,364 | 5.48 GiB/s |
+| `hot_read` | 3,206,592 | 6,411,511 | 24.46 GiB/s |
+| `hot_write` | 2,660,523 | 5,320,143 | 20.30 GiB/s |
+| `cold_read` | 484,167 | 968,148 | 3.69 GiB/s |
+
+Single-thread hot-read latency over 20,000 samples:
+
+| Percentile | Latency |
+| --- | ---: |
+| p50 | 327 ns |
+| p99 | 558 ns |
+
+These are userspace round-trip timings for a 4 KiB page that is already in the
+cache. They exclude the NBD socket, the kernel block layer, and the client.
 
 Use these numbers to compare code changes on the same class of runner, not to
 predict USB performance. Attach a real USB device and rerun the benchmark for
