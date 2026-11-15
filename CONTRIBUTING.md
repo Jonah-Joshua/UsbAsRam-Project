@@ -12,7 +12,7 @@ honest about the limits of USB storage.
 
 ## Development
 
-The workspace requires Rust 1.82 or newer.
+The workspace requires Rust 1.85 or newer.
 
 ```bash
 cargo fmt --all -- --check

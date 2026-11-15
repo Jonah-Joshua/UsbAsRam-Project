@@ -33,9 +33,10 @@ pub(crate) struct Shard {
 
 impl Shard {
     fn new(capacity: usize) -> Self {
+        let reserve = capacity.min(1024);
         Self {
-            pages: HashMap::with_capacity(capacity),
-            clock: Vec::with_capacity(capacity),
+            pages: HashMap::with_capacity(reserve),
+            clock: Vec::with_capacity(reserve),
             hand: 0,
             capacity,
         }

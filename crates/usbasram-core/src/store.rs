@@ -18,6 +18,9 @@ use crate::PAGE_SIZE;
 const MAX_FLUSH_BATCH: usize = 256;
 const ZERO_PAGE: [u8; PAGE_SIZE] = [0u8; PAGE_SIZE];
 
+type DirtyPage = (u64, Box<[u8; PAGE_SIZE]>, u64);
+type PageWrite<'a> = (u64, &'a [u8], u64);
+
 /// Configuration for a tiered store.
 #[derive(Clone, Debug)]
 pub struct StoreConfig {
@@ -209,7 +212,7 @@ impl Store {
                 .min(capacity_pages)
                 .max(1),
         )
-        .unwrap_or(usize::MAX);
+        .map_err(|_| Error::Config("cache is too large for this platform".into()))?;
         let cache_bytes = cache_pages as u64 * PAGE_SIZE as u64;
 
         recover_sidecars(&config.path, config.create)?;
@@ -310,12 +313,14 @@ impl Store {
     /// Open an existing store without requiring the caller to know its size.
     pub fn open_existing(path: impl Into<PathBuf>, cache_bytes: u64) -> Result<Self> {
         let path = path.into();
-        let file = File::open(&path)?;
-        let len = file.metadata()?.len();
-        if len < DATA_OFFSET {
-            return Err(Error::corrupt("store file is incomplete"));
-        }
-        let (superblock, _) = load_best_superblock(&file, len)?;
+        let superblock = {
+            let file = File::open(&path)?;
+            let len = file.metadata()?.len();
+            if len < DATA_OFFSET {
+                return Err(Error::corrupt("store file is incomplete"));
+            }
+            load_best_superblock(&file, len)?.0
+        };
         let size_bytes = superblock
             .capacity_pages
             .checked_mul(PAGE_SIZE as u64)
@@ -656,7 +661,7 @@ impl Store {
             page.generation = generation;
             return Ok(());
         }
-        self.ensure_space_locked(&mut *shard)?;
+        self.ensure_space_locked(&mut shard)?;
         let mut page = Box::new([0u8; PAGE_SIZE]);
         page.copy_from_slice(data);
         shard.insert(page_no, CachePage::new(page, generation, true));
@@ -692,7 +697,7 @@ impl Store {
         }
         let (mut page, _) = self.load_page_data(page_no)?;
         modify(&mut page[page_offset..end]);
-        self.ensure_space_locked(&mut *shard)?;
+        self.ensure_space_locked(&mut shard)?;
         shard.insert(page_no, CachePage::new(page, generation, true));
         Ok(())
     }
@@ -707,7 +712,7 @@ impl Store {
         if shard.pages.contains_key(&page_no) {
             return Ok(());
         }
-        self.ensure_space_locked(&mut *shard)?;
+        self.ensure_space_locked(&mut shard)?;
         shard.insert(page_no, CachePage::new(data, generation, false));
         Ok(())
     }
@@ -716,8 +721,7 @@ impl Store {
         while shard.pages.len() >= shard.capacity {
             let (page_no, victim) = shard.evict_candidate().ok_or(Error::CacheFull)?;
             if victim.dirty {
-                if let Err(error) = self.spill_page(page_no, victim.data.as_ref(), victim.generation)
-                {
+                if let Err(error) = self.spill_page(page_no, &victim.data[..], victim.generation) {
                     shard.insert(page_no, victim);
                     return Err(error);
                 }
@@ -768,7 +772,7 @@ impl Store {
         let mut did_work = false;
 
         loop {
-            let mut batch: Vec<(u64, Box<[u8; PAGE_SIZE]>, u64)> = Vec::new();
+            let mut batch: Vec<DirtyPage> = Vec::new();
             for shard in self.cache.shards() {
                 let guard = shard.lock();
                 for (page_no, page) in &guard.pages {
@@ -787,9 +791,9 @@ impl Store {
                 break;
             }
 
-            let references: Vec<(u64, &[u8], u64)> = batch
+            let references: Vec<PageWrite<'_>> = batch
                 .iter()
-                .map(|(page_no, data, generation)| (*page_no, data.as_ref(), *generation))
+                .map(|(page_no, data, generation)| (*page_no, &data[..], *generation))
                 .collect();
             let extents = self.append_pages(&references)?;
             if extents.len() != batch.len() {
@@ -893,7 +897,7 @@ impl Store {
         Ok(report)
     }
 
-    fn append_pages(&self, pages: &[(u64, &[u8], u64)]) -> Result<Vec<Extent>> {
+    fn append_pages(&self, pages: &[PageWrite<'_>]) -> Result<Vec<Extent>> {
         if pages.is_empty() {
             return Ok(Vec::new());
         }

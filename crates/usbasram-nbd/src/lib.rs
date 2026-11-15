@@ -414,7 +414,7 @@ mod tests {
     #[test]
     fn go_name_parsing_rejects_truncation() {
         assert!(parse_go_name(&[0, 0, 0, 8, b'x']).is_err());
-        assert_eq!(parse_go_name(&[0, 0, 0, 1, b'x']).unwrap(), b"x");
+        assert_eq!(parse_go_name(&[0, 0, 0, 1, b'x']).unwrap(), &b"x"[..]);
     }
 
     #[test]

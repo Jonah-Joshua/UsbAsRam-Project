@@ -73,7 +73,7 @@ impl Superblock {
         if buf.len() < SUPERBLOCK_CRC_OFFSET + 4 {
             return Err(Error::corrupt("superblock is too short"));
         }
-        if buf[0..8] != SUPERBLOCK_MAGIC {
+        if buf[0..8] != SUPERBLOCK_MAGIC[..] {
             return Err(Error::corrupt("superblock magic does not match"));
         }
         let version = u32::from_le_bytes(buf[8..12].try_into().expect("fixed slice"));

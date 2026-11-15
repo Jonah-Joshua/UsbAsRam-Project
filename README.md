@@ -44,7 +44,7 @@ working, testable, cross-platform storage engine rather than a kernel stub.
 
 ## Quick start
 
-Build from source (Rust 1.82 or newer):
+Build from source (Rust 1.85 or newer):
 
 ```bash
 cargo build --release

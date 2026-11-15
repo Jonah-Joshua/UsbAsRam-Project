@@ -35,8 +35,14 @@ fn handshake_write_read_flush() {
     let mut client = TcpStream::connect(address).unwrap();
     let mut hello = [0u8; 18];
     client.read_exact(&mut hello).unwrap();
-    assert_eq!(&hello[0..8], &NBDMAGIC.to_be_bytes());
-    assert_eq!(&hello[8..16], &IHAVEOPT.to_be_bytes());
+    assert_eq!(
+        u64::from_be_bytes(hello[0..8].try_into().unwrap()),
+        NBDMAGIC
+    );
+    assert_eq!(
+        u64::from_be_bytes(hello[8..16].try_into().unwrap()),
+        IHAVEOPT
+    );
     let handshake_flags = u16::from_be_bytes(hello[16..18].try_into().unwrap());
     assert_eq!(handshake_flags & 1, 1);
     client.write_all(&3u32.to_be_bytes()).unwrap(); // FIXED_NEWSTYLE | NO_ZEROES
@@ -54,7 +60,10 @@ fn handshake_write_read_flush() {
     loop {
         let mut header = [0u8; 20];
         client.read_exact(&mut header).unwrap();
-        assert_eq!(&header[0..8], &OPTION_REPLY_MAGIC.to_be_bytes());
+        assert_eq!(
+            u64::from_be_bytes(header[0..8].try_into().unwrap()),
+            OPTION_REPLY_MAGIC
+        );
         assert_eq!(
             u32::from_be_bytes(header[8..12].try_into().unwrap()),
             7,
@@ -80,7 +89,10 @@ fn handshake_write_read_flush() {
     send_request(&mut client, 0, 44, 3 * PAGE_SIZE as u64, PAGE_SIZE as u32, None);
     let mut reply = [0u8; 16];
     client.read_exact(&mut reply).unwrap();
-    assert_eq!(&reply[0..4], &SIMPLE_REPLY_MAGIC.to_be_bytes());
+    assert_eq!(
+        u32::from_be_bytes(reply[0..4].try_into().unwrap()),
+        SIMPLE_REPLY_MAGIC
+    );
     assert_eq!(u32::from_be_bytes(reply[4..8].try_into().unwrap()), 0);
     assert_eq!(u64::from_be_bytes(reply[8..16].try_into().unwrap()), 44);
     let mut read_back = vec![0u8; PAGE_SIZE];
@@ -119,7 +131,10 @@ fn send_request(
 fn read_simple_reply(client: &mut TcpStream, cookie: u64) {
     let mut reply = [0u8; 16];
     client.read_exact(&mut reply).unwrap();
-    assert_eq!(&reply[0..4], &SIMPLE_REPLY_MAGIC.to_be_bytes());
+    assert_eq!(
+        u32::from_be_bytes(reply[0..4].try_into().unwrap()),
+        SIMPLE_REPLY_MAGIC
+    );
     assert_eq!(u32::from_be_bytes(reply[4..8].try_into().unwrap()), 0);
     assert_eq!(u64::from_be_bytes(reply[8..16].try_into().unwrap()), cookie);
 }
