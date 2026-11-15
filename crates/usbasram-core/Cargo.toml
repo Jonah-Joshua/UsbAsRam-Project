@@ -1,0 +1,18 @@
+[package]
+name = "usbasram-core"
+description = "Core tiered page store: RAM hot tier, compressed USB-backed cold tier."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+crc32c.workspace = true
+lz4_flex.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

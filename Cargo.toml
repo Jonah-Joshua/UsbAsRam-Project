@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/usbasram-core",
+    "crates/usbasram-nbd",
+    "crates/usbasram-cli",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Jonah-Joshua/UsbAsRam-Project"
+authors = ["Jonah Joshua and contributors"]
+description = "A crash-safe, tiered RAM + USB storage engine written in Rust."
+
+[workspace.dependencies]
+usbasram-core = { path = "crates/usbasram-core", version = "1.0.0" }
+usbasram-nbd = { path = "crates/usbasram-nbd", version = "1.0.0" }
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+crc32c = "0.6"
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-decode", "safe-encode"] }
+parking_lot = "0.12"
+thiserror = "2.0"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.bench]
+lto = "fat"
+codegen-units = 1
