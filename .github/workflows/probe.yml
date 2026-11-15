@@ -1,0 +1,48 @@
+name: IOCP probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    steps:
+      - name: Probe completion-port association
+        shell: pwsh
+        run: |
+          $code = @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class Probe {
+            [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+            public static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr sa, uint disp, uint flags, IntPtr template);
+            [DllImport("kernel32.dll", SetLastError=true)]
+            public static extern IntPtr CreateIoCompletionPort(IntPtr file, IntPtr port, UIntPtr key, uint threads);
+            [DllImport("kernel32.dll", SetLastError=true)]
+            public static extern bool CloseHandle(IntPtr h);
+            public static string Run(string path, uint flags) {
+              const uint GENERIC_READ=0x80000000, GENERIC_WRITE=0x40000000;
+              const uint FILE_SHARE_READ=1, FILE_SHARE_WRITE=2, FILE_SHARE_DELETE=4;
+              const uint OPEN_ALWAYS=4;
+              IntPtr file=CreateFileW(path, GENERIC_READ|GENERIC_WRITE, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, IntPtr.Zero, OPEN_ALWAYS, flags, IntPtr.Zero);
+              if (file==new IntPtr(-1)) return "CreateFile failed " + Marshal.GetLastWin32Error();
+              IntPtr port=CreateIoCompletionPort(new IntPtr(-1), IntPtr.Zero, UIntPtr.Zero, 0);
+              if (port==IntPtr.Zero) { int e=Marshal.GetLastWin32Error(); CloseHandle(file); return "CreatePort failed " + e; }
+              IntPtr assoc=CreateIoCompletionPort(file, port, UIntPtr.Zero, 0);
+              int assocErr=Marshal.GetLastWin32Error();
+              CloseHandle(port); CloseHandle(file);
+              return "assoc=" + (assoc!=IntPtr.Zero) + " err=" + assocErr;
+            }
+          }
+          '@
+          Add-Type -TypeDefinition $code -Language CSharp
+          $paths = @(
+            (Join-Path $env:RUNNER_TEMP 'probe-d.bin'),
+            (Join-Path $env:SystemDrive 'probe-c.bin')
+          )
+          foreach ($path in $paths) {
+            foreach ($flags in @(0x40000000, 0x60000000)) {
+              Remove-Item $path -ErrorAction SilentlyContinue
+              Write-Output ("{0} flags={1:X8} => {2}" -f $path, $flags, [Probe]::Run($path, $flags))
+            }
+          }
