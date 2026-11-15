@@ -55,16 +55,16 @@ far the shared read path scales; the default depths are `1,4,16,64`.
 
 ## Reference CI run
 
-The numbers below are retained from the v1.1.0 release run, which used the
-earlier benchmark schema (no per-queue-depth phases, no raw backend phases, and
-no p99.9 latency). They are still useful as a baseline for the portable path,
-but the tables will be replaced with v1.2.0 measurements that include direct
-I/O and queue-depth scaling.
+The tables below are the v1.2.0 reference runs from the `CI` workflow on
+2026-11-15. They use the expanded schema: queue-depth scaling, p99.9 tail
+latency, and a raw backend phase. The v1.1.0 tables used the earlier
+single-thread schema and are not directly comparable.
 
-The following run is from the `CI` workflow on 2026-11-15. It is a **software
-path measurement on a GitHub-hosted runner**, not a USB device measurement. The
-backing file lives on the runner's local disk and may be served from the OS page
-cache, so `cold_read` here overstates what a real USB flash drive can do.
+This is a **software path measurement on a GitHub-hosted runner**, not a USB
+device measurement. The backing file lives on the runner's local disk. The
+portable run is served largely from the OS page cache, so its `cold_read`
+overstates what a real USB flash drive can do. The direct run bypasses the page
+cache and shows the storage path.
 
 - Store: 64 MiB, compression on
 - Hot cache: 64 MiB
@@ -72,38 +72,74 @@ cache, so `cold_read` here overstates what a real USB flash drive can do.
 - Threads: 4
 - Phase duration: 0.5 s
 - Runner: `ubuntu-latest` (shared GitHub-hosted hardware)
+- Effective mode: `portable` and `direct`, no hugepages, no SQPOLL
+
+### Portable backend
+
+| Phase | Queue depth | IOPS | Throughput |
+| --- | ---: | ---: | ---: |
+| `hot_read` | 1 | 1,938,695 | 7.40 GiB/s |
+| `hot_read` | 4 | 6,886,605 | 26.27 GiB/s |
+| `hot_read` | 16 | 6,999,709 | 26.70 GiB/s |
+| `hot_read` | 64 | 6,912,489 | 26.37 GiB/s |
+| `hot_write` | 1 | 2,181,135 | 8.32 GiB/s |
+| `hot_write` | 4 | 6,910,574 | 26.36 GiB/s |
+| `hot_write` | 16 | 6,547,630 | 24.98 GiB/s |
+| `hot_write` | 64 | 6,257,602 | 23.87 GiB/s |
+| `cold_read` | 64 | 1,269,270 | 4.84 GiB/s |
+| `raw_write` | 1 | 67,472 | 0.257 GiB/s |
+| `raw_read` | 1 | 7,806,202 | 29.78 GiB/s |
+
+### Direct backend
+
+| Phase | Queue depth | IOPS | Throughput |
+| --- | ---: | ---: | ---: |
+| `hot_read` | 1 | 1,878,475 | 7.17 GiB/s |
+| `hot_read` | 4 | 6,889,905 | 26.28 GiB/s |
+| `hot_read` | 16 | 6,790,270 | 25.90 GiB/s |
+| `hot_read` | 64 | 6,722,906 | 25.65 GiB/s |
+| `hot_write` | 1 | 2,032,276 | 7.75 GiB/s |
+| `hot_write` | 4 | 6,498,711 | 24.79 GiB/s |
+| `hot_write` | 16 | 6,494,506 | 24.78 GiB/s |
+| `hot_write` | 64 | 5,800,993 | 22.13 GiB/s |
+| `cold_read` | 64 | 15,627 | 0.060 GiB/s |
+| `raw_write` | 1 | 69,347 | 0.265 GiB/s |
+| `raw_read` | 1 | 136,392 | 0.520 GiB/s |
+
+The direct raw phases are the honest storage numbers: `O_DIRECT` bypasses the
+page cache, so `raw_read` falls from 29.78 GiB/s to 0.52 GiB/s while the hot
+phases stay in RAM. The portable `cold_read` is fast because the runner's page
+cache already holds the file. Use a real USB device and the direct backend to
+measure the device itself.
+
+### Tail latency
+
+| Backend | Phase | p50 | p99 | p99.9 |
+| --- | --- | ---: | ---: | ---: |
+| `portable` | hot read | 470 ns | 902 ns | 1,091 ns |
+| `portable` | cold read | 2,133 ns | 2,533 ns | 9,764 ns |
+| `direct` | hot read | 501 ns | 902 ns | 1,091 ns |
+| `direct` | cold read | 270,444 ns | 617,633 ns | 671,012 ns |
+
+The latency pass records 50,000 hot-read samples and 20,000 cold-read samples.
+Hot numbers are userspace round-trip timings for a 4 KiB page that is already in
+the cache. They exclude the NBD socket, the kernel block layer, and the client.
 
 Run-to-run variance on shared runners is large enough that a few percent
 difference is noise. Compare changes only against runs on the same runner class.
-
-| Phase | Operations | IOPS | Throughput |
-| --- | ---: | ---: | ---: |
-| `hot_read` | 3,418,288 | 6,834,978 | 26.07 GiB/s |
-| `hot_write` | 3,203,212 | 6,404,706 | 24.43 GiB/s |
-| `cold_read` | 486,776 | 973,281 | 3.71 GiB/s |
-
-Single-thread hot-read latency over 20,000 samples:
-
-| Percentile | Latency |
-| --- | ---: |
-| p50 | 380 ns |
-| p99 | 771 ns |
-
-These are userspace round-trip timings for a 4 KiB page that is already in the
-cache. They exclude the NBD socket, the kernel block layer, and the client.
-
-Use these numbers to compare code changes on the same class of runner, not to
-predict USB performance. Attach a real USB device and rerun the benchmark for
-device-specific results. The latest JSON is always available as the
-`benchmark-json` artifact on the CI run.
+Use these numbers to compare code changes, not to predict USB performance.
+Attach a real USB device and rerun the benchmark for device-specific results.
+The latest JSON is always available as the `benchmark-json` artifact on the CI
+run.
 
 ## How to read the numbers
 
 - `hot_read` and `hot_write` are upper bounds for this engine. They depend on
   CPU, memory bandwidth, thread count, queue depth, and cache sharding.
-- `cold_read` is the number that reflects the USB device. It is dominated by
-  the backing storage and the amount of compressible data. It will be orders of
-  magnitude slower than the hot phases.
+- `cold_read` is the number that reflects the USB device in direct mode. It is
+  dominated by the backing storage and the amount of compressible data. It will
+  be orders of magnitude slower than the hot phases. In portable mode the OS
+  page cache can make cold reads look much faster than the device.
 - `raw_write` and `raw_read` isolate the selected backend. Compare them with
   the matching portable run to see what direct I/O or io_uring changes on the
   same device. They exclude compression and the record format.

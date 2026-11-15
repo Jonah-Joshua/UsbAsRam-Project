@@ -341,9 +341,10 @@ covers writes from every connection.
 
 ## 11. I/O backends
 
-The engine talks to a private `Backend` trait with two operations:
-`read_exact_at` and `write_all_at`. The backend is chosen once, when the store
-is opened, and is never part of the on-disk format.
+The engine talks to a private `Backend` trait with positioned `read_exact_at`
+and `write_all_at` operations plus a one-time `prepare` hook for handles that
+need setup. The backend is chosen once, when the store is opened, and is never
+part of the on-disk format.
 
 | Requested mode | Platform | Mechanism | Fallback |
 | --- | --- | --- | --- |
@@ -369,8 +370,11 @@ synchronous and the completion ordering simple. Queue-depth scaling in the
 benchmark comes from concurrent caller threads, not from an internal
 submission queue. `SQPOLL` is requested when the kernel allows it; otherwise
 the ring falls back to ordinary `io_uring_enter` submissions. The IOCP backend
-opens the file for overlapped I/O, associates the handle with a completion
-port, and waits for each completion before returning.
+opens the file with explicit `FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING`
+flags, associates the handle with a completion port once at open time, and
+waits for each completion before returning. Association is deliberately not
+repeated per request: some Windows versions reject re-association of an
+already associated handle with `ERROR_INVALID_PARAMETER`.
 
 ## 12. Memory and hugepages
 
