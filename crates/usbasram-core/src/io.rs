@@ -813,8 +813,8 @@ mod iocp {
         use std::os::windows::io::FromRawHandle;
         use windows_sys::Win32::Storage::FileSystem::{
             CreateFileW, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_NO_BUFFERING,
-            FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS,
-            OPEN_EXISTING,
+            FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            OPEN_ALWAYS, OPEN_EXISTING,
         };
 
         let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
