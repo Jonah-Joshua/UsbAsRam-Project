@@ -1,0 +1,13 @@
+/target
+/dist
+/bench.json
+**/*.rs.bk
+*.usr
+*.usr.compact
+*.usr.old
+*.store
+*.store.compact
+*.store.old
+*.log
+.DS_Store
+Thumbs.db

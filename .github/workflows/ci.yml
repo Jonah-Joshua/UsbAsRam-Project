@@ -1,0 +1,196 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings -A clippy::uninlined_format_args -A clippy::print_literal
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --workspace --all-targets
+
+  msrv:
+    name: MSRV 1.85.0
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked --workspace --all-targets
+
+  features:
+    name: Features (${{ matrix.os }} / ${{ matrix.features }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            features: direct-io
+          - os: ubuntu-latest
+            features: hugepages
+          - os: ubuntu-latest
+            features: io-uring
+          - os: ubuntu-latest
+            features: hardware
+          - os: windows-latest
+            features: iocp
+          - os: windows-latest
+            features: hardware
+          - os: macos-latest
+            features: direct-io
+          - os: macos-latest
+            features: hardware
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked -p usbasram-core --all-targets --no-default-features --features "${{ matrix.features }}"
+
+  all-features:
+    name: All features (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked --workspace --all-targets --all-features
+
+  hardware-tests:
+    name: Hardware tests (${{ matrix.os }} / ${{ matrix.engine }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            engine: uring
+          - os: windows-latest
+            engine: iocp
+          - os: macos-latest
+            engine: direct
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Direct I/O and hugepage tests
+        run: cargo test --locked -p usbasram-core --features "direct-io hugepages" --test store
+      - name: Smoke test the CLI engine
+        shell: bash
+        run: |
+          store="${{ runner.temp }}/smoke-${{ matrix.engine }}.usr"
+          cargo run --locked -p usbasram-cli --features hardware -- init "$store" --size 32M --io "${{ matrix.engine }}" --hugepages
+          cargo run --locked -p usbasram-cli --features hardware -- info "$store" --io "${{ matrix.engine }}" --hugepages
+          cargo run --locked -p usbasram-cli --features hardware -- verify "$store" --io "${{ matrix.engine }}" --hugepages
+
+  miri:
+    name: Miri
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo miri test --locked -p usbasram-core --lib
+
+  sanitizer:
+    name: Sanitizer (Address)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked -p usbasram-core --test store --target x86_64-unknown-linux-gnu -Zbuild-std
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+          ASAN_OPTIONS: detect_leaks=0
+
+  build:
+    name: Release build (${{ matrix.os }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --workspace --release
+
+  benchmark:
+    name: Benchmark
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run benchmark (portable)
+        run: |
+          cargo run --locked --release -p usbasram-cli --features hardware -- bench --quick --json > bench.json
+          cat bench.json
+      - name: Run benchmark (direct)
+        run: |
+          cargo run --locked --release -p usbasram-cli --features hardware -- bench --quick --io direct --json > bench-direct.json
+          cat bench-direct.json
+      - name: Upload benchmark result
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-json
+          path: |
+            bench.json
+            bench-direct.json
+          if-no-files-found: error

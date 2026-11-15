@@ -1,0 +1,28 @@
+[package]
+name = "usbasram-cli"
+description = "Command-line interface and benchmark suite for usbasram."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "usbasram"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tempfile = "3"
+usbasram-core.workspace = true
+usbasram-nbd.workspace = true
+
+[features]
+default = []
+direct-io = ["usbasram-core/direct-io"]
+hugepages = ["usbasram-core/hugepages"]
+io-uring = ["usbasram-core/io-uring"]
+iocp = ["usbasram-core/iocp"]
+hardware = ["direct-io", "hugepages", "io-uring", "iocp"]

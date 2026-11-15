@@ -1,0 +1,47 @@
+[package]
+name = "usbasram-core"
+description = "Core tiered page store: RAM hot tier, compressed USB-backed cold tier."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+# Use O_DIRECT / FILE_FLAG_NO_BUFFERING / F_NOCACHE where available.
+direct-io = []
+# Back cache pages and I/O buffers with large pages when the OS allows it.
+hugepages = []
+# Linux io_uring with a registered fixed buffer and optional SQPOLL.
+io-uring = ["direct-io", "dep:io-uring"]
+# Windows I/O completion ports.
+iocp = ["dep:windows-sys"]
+# Every optional acceleration path.
+hardware = ["direct-io", "hugepages", "io-uring", "iocp"]
+
+[dependencies]
+crc32c.workspace = true
+lz4_flex.workspace = true
+parking_lot.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.7", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+] }
+
+[dev-dependencies]
+tempfile = "3"
