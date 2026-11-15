@@ -85,7 +85,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run benchmark
-        run: cargo run --locked --release -p usbasram-cli -- bench --quick --json | tee bench.json
+        run: |
+          cargo run --locked --release -p usbasram-cli -- bench --quick --json > bench.json
+          cat bench.json
       - name: Upload benchmark result
         uses: actions/upload-artifact@v4
         with:

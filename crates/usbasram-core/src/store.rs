@@ -17,6 +17,7 @@ use crate::PAGE_SIZE;
 
 const MAX_FLUSH_BATCH: usize = 256;
 const ZERO_PAGE: [u8; PAGE_SIZE] = [0u8; PAGE_SIZE];
+const MAX_RECORD_LEN: u64 = ((RECORD_HEADER_SIZE + PAGE_SIZE + 7) & !7) as u64;
 
 type DirtyPage = (u64, Box<[u8; PAGE_SIZE]>, u64);
 type PageWrite<'a> = (u64, &'a [u8], u64);
@@ -32,7 +33,8 @@ pub struct StoreConfig {
     pub cache_bytes: u64,
     /// Maximum size of the append-only cold log in bytes.
     ///
-    /// If `None`, [`min_log_bytes`] is used. A smaller log is rejected because
+    /// If `None`, a log with 25% headroom above the logical size is used (but
+    /// never smaller than [`min_log_bytes`]). A smaller log is rejected because
     /// compaction must be able to hold every page in the worst case.
     pub log_bytes: Option<u64>,
     /// Compress cold pages with LZ4 before writing them.
@@ -43,7 +45,7 @@ pub struct StoreConfig {
 
 impl StoreConfig {
     /// Create a configuration with compression enabled, a 256 MiB hot cache,
-    /// and a log sized for the full logical capacity.
+    /// and a cold log with 25% headroom above the logical size.
     pub fn new(path: impl Into<PathBuf>, size_bytes: u64) -> Self {
         Self {
             path: path.into(),
@@ -148,11 +150,18 @@ fn checked_min_log_bytes(size_bytes: u64) -> Result<u64> {
     let records = pages
         .checked_add(MAX_FLUSH_BATCH as u64)
         .ok_or_else(|| Error::Config("store is too large for this format".into()))?;
-    let per_record = (PAGE_SIZE + RECORD_HEADER_SIZE) as u64;
     records
-        .checked_mul(per_record)
+        .checked_mul(MAX_RECORD_LEN)
         .map(|bytes| align_up(bytes, PAGE_SIZE as u64))
         .ok_or_else(|| Error::Config("store is too large for this format".into()))
+}
+
+fn default_log_bytes(size_bytes: u64) -> Result<u64> {
+    let minimum = checked_min_log_bytes(size_bytes)?;
+    let preferred = size_bytes
+        .checked_add(size_bytes / 4)
+        .ok_or_else(|| Error::Config("store is too large for this format".into()))?;
+    Ok(align_up(preferred.max(minimum), PAGE_SIZE as u64))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -231,8 +240,10 @@ impl Store {
             if !config.create {
                 return Err(Error::corrupt("store file is incomplete"));
             }
-            let minimum = checked_min_log_bytes(config.size_bytes)?;
-            let log_bytes = config.log_bytes.unwrap_or(minimum);
+            let log_bytes = match config.log_bytes {
+                Some(log_bytes) => log_bytes,
+                None => default_log_bytes(config.size_bytes)?,
+            };
             let superblock = Superblock::new(
                 capacity_pages,
                 log_bytes,
@@ -907,7 +918,7 @@ impl Store {
             return Ok(Vec::new());
         }
         let worst = (pages.len() as u64)
-            .checked_mul((PAGE_SIZE + RECORD_HEADER_SIZE + 8) as u64)
+            .checked_mul(MAX_RECORD_LEN)
             .ok_or_else(|| Error::Config("batch is too large".into()))?;
 
         let mut writer = self.writer.lock();

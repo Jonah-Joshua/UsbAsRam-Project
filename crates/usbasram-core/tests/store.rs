@@ -134,6 +134,41 @@ fn repeated_overwrites_trigger_compaction() {
 }
 
 #[test]
+fn minimum_log_survives_repeated_full_capacity_flushes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.usr");
+    let pages = 64u64;
+    let capacity = pages * PAGE_SIZE as u64;
+    let log_bytes = usbasram_core::min_log_bytes(capacity);
+    let config = StoreConfig::new(&path, capacity)
+        .with_cache_bytes(capacity)
+        .with_log_bytes(log_bytes);
+    let store = Store::open(config.clone()).unwrap();
+    let data = pattern(11, PAGE_SIZE);
+
+    for round in 0..8u8 {
+        for page in 0..pages {
+            let mut block = data.clone();
+            block[0] = round;
+            store.write_at(page * PAGE_SIZE as u64, &block).unwrap();
+        }
+        store.flush().unwrap();
+    }
+
+    assert!(store.stats().compactions > 0);
+    store.verify().unwrap();
+    let mut out = vec![0u8; PAGE_SIZE];
+    store.read_at(0, &mut out).unwrap();
+    assert_eq!(out[0], 7);
+    drop(store);
+
+    let reopened = Store::open(config).unwrap();
+    reopened.verify().unwrap();
+    reopened.read_at(0, &mut out).unwrap();
+    assert_eq!(out[0], 7);
+}
+
+#[test]
 fn rejects_wrong_capacity() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("store.usr");

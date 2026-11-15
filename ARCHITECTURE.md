@@ -187,8 +187,10 @@ Compaction runs when the append would exceed `log_bytes`, or when the user calls
    generation, and delete `<store>.old`.
 
 Every live page is copied in the worst case, so the minimum log size includes
-one full logical capacity plus a full flush batch. The sidecar requires enough
-free space for a second copy of the live set.
+one full logical capacity plus a full flush batch. The default log adds 25%
+headroom above the logical size to reduce compaction frequency; use
+`--log-size` to choose a different value. The sidecar requires enough free space
+for a second copy of the live set.
 
 ## 8. Recovery
 
