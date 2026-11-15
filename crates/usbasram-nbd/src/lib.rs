@@ -331,17 +331,15 @@ fn transmission<S: Read + Write>(stream: &mut S, store: &Store) -> io::Result<()
                     send_simple_reply(stream, EINVAL, cookie, None)?;
                     continue;
                 }
-                let result = store
-                    .write_at(offset, &data)
-                    .and_then(|written| {
-                        if written != data.len() {
-                            return Err(StoreError::Config("short write".into()));
-                        }
-                        if fua {
-                            store.flush()?;
-                        }
-                        Ok(())
-                    });
+                let result = store.write_at(offset, &data).and_then(|written| {
+                    if written != data.len() {
+                        return Err(StoreError::Config("short write".into()));
+                    }
+                    if fua {
+                        store.flush()?;
+                    }
+                    Ok(())
+                });
                 match result {
                     Ok(()) => send_simple_reply(stream, 0, cookie, None)?,
                     Err(error) => send_simple_reply(stream, store_error(&error), cookie, None)?,

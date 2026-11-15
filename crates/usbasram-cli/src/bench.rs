@@ -86,9 +86,8 @@ pub fn run(options: BenchOptions) -> Result<()> {
     }
 
     {
-        let store = Store::open(
-            StoreConfig::new(&path, options.size_bytes).with_cache_bytes(cold_cache),
-        )?;
+        let store =
+            Store::open(StoreConfig::new(&path, options.size_bytes).with_cache_bytes(cold_cache))?;
         let started = Instant::now();
         let (ops, bytes) = read_phase(&store, pages, options.threads, options.seconds);
         phases.push(Phase {
@@ -132,7 +131,10 @@ pub fn run(options: BenchOptions) -> Result<()> {
         options.threads
     );
     println!();
-    println!("  {:<12} {:>14} {:>14} {:>14}", "phase", "ops", "IOPS", "throughput");
+    println!(
+        "  {:<12} {:>14} {:>14} {:>14}",
+        "phase", "ops", "IOPS", "throughput"
+    );
     for phase in &phases {
         println!(
             "  {:<12} {:>14} {:>14.0} {:>14.2} GiB/s",

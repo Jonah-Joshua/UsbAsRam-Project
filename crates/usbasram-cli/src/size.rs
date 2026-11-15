@@ -7,7 +7,9 @@ pub fn parse_size(input: &str) -> Result<u64> {
         bail!("size is empty");
     }
     let split = trimmed
-        .find(|character: char| !(character.is_ascii_digit() || character == '.' || character == '_'))
+        .find(|character: char| {
+            !(character.is_ascii_digit() || character == '.' || character == '_')
+        })
         .unwrap_or(trimmed.len());
     let (number, suffix) = trimmed.split_at(split);
     let number: f64 = number

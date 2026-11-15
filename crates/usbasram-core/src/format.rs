@@ -198,8 +198,11 @@ impl RecordHeader {
                 "unsupported record version {version}"
             )));
         }
-        let stored_crc =
-            u32::from_le_bytes(buf[RECORD_CRC_OFFSET..RECORD_CRC_OFFSET + 4].try_into().expect("fixed slice"));
+        let stored_crc = u32::from_le_bytes(
+            buf[RECORD_CRC_OFFSET..RECORD_CRC_OFFSET + 4]
+                .try_into()
+                .expect("fixed slice"),
+        );
         let actual_crc = crc32c::crc32c(&buf[..RECORD_CRC_OFFSET]);
         if stored_crc != actual_crc {
             return Err(Error::corrupt("record header checksum mismatch"));

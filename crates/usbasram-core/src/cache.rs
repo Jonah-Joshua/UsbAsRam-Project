@@ -177,10 +177,7 @@ mod tests {
         }
         let (page_no, _) = shard.evict_candidate().expect("victim");
         assert!(page_no < 2);
-        shard.insert(
-            9,
-            CachePage::new(Box::new([9u8; PAGE_SIZE]), 1, false),
-        );
+        shard.insert(9, CachePage::new(Box::new([9u8; PAGE_SIZE]), 1, false));
         assert_eq!(shard.pages.len(), 2);
     }
 

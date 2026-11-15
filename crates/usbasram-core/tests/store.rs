@@ -114,9 +114,7 @@ fn repeated_overwrites_trigger_compaction() {
             let mut block = data.clone();
             block[0] = round;
             block[1] = page as u8;
-            store
-                .write_at(page * PAGE_SIZE as u64, &block)
-                .unwrap();
+            store.write_at(page * PAGE_SIZE as u64, &block).unwrap();
         }
         store.flush().unwrap();
     }

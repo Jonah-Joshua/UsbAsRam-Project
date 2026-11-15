@@ -89,7 +89,9 @@ impl StoreConfig {
             ));
         }
         if self.cache_bytes == 0 {
-            return Err(Error::Config("cache_bytes must be greater than zero".into()));
+            return Err(Error::Config(
+                "cache_bytes must be greater than zero".into(),
+            ));
         }
         let minimum = checked_min_log_bytes(self.size_bytes)?;
         if let Some(log_bytes) = self.log_bytes {
@@ -100,9 +102,7 @@ impl StoreConfig {
                 )));
             }
             if log_bytes % PAGE_SIZE as u64 != 0 {
-                return Err(Error::Config(
-                    "log_bytes must be a multiple of 4096".into(),
-                ));
+                return Err(Error::Config("log_bytes must be a multiple of 4096".into()));
             }
         }
         Ok(())
@@ -267,7 +267,11 @@ impl Store {
 
         let log_bytes = superblock.log_bytes;
         let (index, recovered_head) = scan_log(&file, &superblock)?;
-        let max_generation = index.values().map(|extent| extent.generation).max().unwrap_or(0);
+        let max_generation = index
+            .values()
+            .map(|extent| extent.generation)
+            .max()
+            .unwrap_or(0);
         let next_generation = max_generation
             .checked_add(1)
             .ok_or_else(|| Error::corrupt("generation counter overflow"))?;
@@ -442,7 +446,8 @@ fn load_best_superblock(file: &File, len: u64) -> Result<(Superblock, usize)> {
             continue;
         }
         match best {
-            Some((current, _)) if current.checkpoint_generation >= superblock.checkpoint_generation => {}
+            Some((current, _))
+                if current.checkpoint_generation >= superblock.checkpoint_generation => {}
             _ => best = Some((superblock, slot as usize)),
         }
     }
@@ -651,7 +656,9 @@ impl Store {
 
     fn cache_write_full(&self, page_no: u64, data: &[u8], generation: u64) -> Result<()> {
         if data.len() != PAGE_SIZE {
-            return Err(Error::Config("page writes must be exactly 4096 bytes".into()));
+            return Err(Error::Config(
+                "page writes must be exactly 4096 bytes".into(),
+            ));
         }
         let mut shard = self.cache.shard_for(page_no).lock();
         if let Some(page) = shard.pages.get_mut(&page_no) {
@@ -745,14 +752,12 @@ impl Store {
 
 fn read_record(file: &File, offset: u64) -> Result<(RecordHeader, Vec<u8>)> {
     let mut header_buffer = [0u8; RECORD_HEADER_SIZE];
-    read_exact_at(file, &mut header_buffer, offset).map_err(|error| {
-        Error::corrupt(format!("reading record header at {offset}: {error}"))
-    })?;
+    read_exact_at(file, &mut header_buffer, offset)
+        .map_err(|error| Error::corrupt(format!("reading record header at {offset}: {error}")))?;
     let header = RecordHeader::decode(&header_buffer)?;
     let mut payload = vec![0u8; header.stored_len as usize];
-    read_exact_at(file, &mut payload, offset + RECORD_HEADER_SIZE as u64).map_err(|error| {
-        Error::corrupt(format!("reading record payload at {offset}: {error}"))
-    })?;
+    read_exact_at(file, &mut payload, offset + RECORD_HEADER_SIZE as u64)
+        .map_err(|error| Error::corrupt(format!("reading record payload at {offset}: {error}")))?;
     if crc32c::crc32c(&payload) != header.payload_crc {
         return Err(Error::corrupt(format!(
             "payload checksum mismatch at {offset}"
@@ -907,24 +912,18 @@ impl Store {
 
         let mut writer = self.writer.lock();
         loop {
-            let end = writer
-                .head
-                .checked_add(worst)
-                .ok_or(Error::LogFull {
-                    needed: worst,
-                    available: 0,
-                })?;
+            let end = writer.head.checked_add(worst).ok_or(Error::LogFull {
+                needed: worst,
+                available: 0,
+            })?;
             if end <= DATA_OFFSET + writer.log_bytes {
                 break;
             }
             self.compact_locked(&mut writer)?;
-            let end = writer
-                .head
-                .checked_add(worst)
-                .ok_or(Error::LogFull {
-                    needed: worst,
-                    available: 0,
-                })?;
+            let end = writer.head.checked_add(worst).ok_or(Error::LogFull {
+                needed: worst,
+                available: 0,
+            })?;
             if end > DATA_OFFSET + writer.log_bytes {
                 return Err(Error::LogFull {
                     needed: worst,
@@ -1215,7 +1214,9 @@ fn encode_record(
 
 fn encode_record_with_payload(header: &RecordHeader, payload: &[u8]) -> Result<Vec<u8>> {
     if payload.len() != header.stored_len as usize {
-        return Err(Error::corrupt("record payload length does not match header"));
+        return Err(Error::corrupt(
+            "record payload length does not match header",
+        ));
     }
     let length = header.record_len() as usize;
     if length < RECORD_HEADER_SIZE + payload.len() {

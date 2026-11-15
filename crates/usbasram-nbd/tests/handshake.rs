@@ -18,8 +18,7 @@ fn handshake_write_read_flush() {
     let path = directory.path().join("nbd.usr");
     let store = Arc::new(
         Store::open(
-            StoreConfig::new(&path, 64 * PAGE_SIZE as u64)
-                .with_cache_bytes(64 * PAGE_SIZE as u64),
+            StoreConfig::new(&path, 64 * PAGE_SIZE as u64).with_cache_bytes(64 * PAGE_SIZE as u64),
         )
         .unwrap(),
     );
@@ -54,7 +53,9 @@ fn handshake_write_read_flush() {
     payload.extend_from_slice(&0u16.to_be_bytes());
     client.write_all(&IHAVEOPT.to_be_bytes()).unwrap();
     client.write_all(&7u32.to_be_bytes()).unwrap(); // NBD_OPT_GO
-    client.write_all(&(payload.len() as u32).to_be_bytes()).unwrap();
+    client
+        .write_all(&(payload.len() as u32).to_be_bytes())
+        .unwrap();
     client.write_all(&payload).unwrap();
 
     loop {
@@ -80,13 +81,27 @@ fn handshake_write_read_flush() {
 
     let mut data = vec![0x5au8; PAGE_SIZE];
     data[0] = 1;
-    send_request(&mut client, 1, 42, 3 * PAGE_SIZE as u64, PAGE_SIZE as u32, Some(&data));
+    send_request(
+        &mut client,
+        1,
+        42,
+        3 * PAGE_SIZE as u64,
+        PAGE_SIZE as u32,
+        Some(&data),
+    );
     read_simple_reply(&mut client, 42);
 
     send_request(&mut client, 3, 43, 0, 0, None);
     read_simple_reply(&mut client, 43);
 
-    send_request(&mut client, 0, 44, 3 * PAGE_SIZE as u64, PAGE_SIZE as u32, None);
+    send_request(
+        &mut client,
+        0,
+        44,
+        3 * PAGE_SIZE as u64,
+        PAGE_SIZE as u32,
+        None,
+    );
     let mut reply = [0u8; 16];
     client.read_exact(&mut reply).unwrap();
     assert_eq!(
