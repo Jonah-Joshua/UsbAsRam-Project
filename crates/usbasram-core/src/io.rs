@@ -102,6 +102,13 @@ trait Backend: Send + Sync {
     fn read_exact_at(&self, file: &File, buf: &mut [u8], offset: u64) -> io::Result<()>;
     fn write_all_at(&self, file: &File, buf: &[u8], offset: u64) -> io::Result<()>;
     fn status(&self) -> IoStatus;
+    /// Prepare a freshly opened handle for this backend. Most backends need
+    /// nothing; IOCP associates the handle with its completion port exactly
+    /// once, because re-associating an already associated handle is rejected
+    /// by some Windows versions.
+    fn prepare(&self, _file: &File) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// A positioned-I/O backend selected at store open time.
@@ -129,6 +136,12 @@ impl Io {
     }
 
     pub(crate) fn open(&self, path: &Path, spec: OpenSpec) -> io::Result<File> {
+        let file = self.open_file(path, spec)?;
+        self.backend.prepare(&file)?;
+        Ok(file)
+    }
+
+    fn open_file(&self, path: &Path, spec: OpenSpec) -> io::Result<File> {
         // The IOCP backend opens its own handle so the overlapped and
         // no-buffering flags are explicit rather than dependent on how the
         // standard library translates `custom_flags`.
@@ -666,8 +679,7 @@ mod iocp {
     use std::sync::Mutex;
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetHandleInformation, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, HANDLE,
-        INVALID_HANDLE_VALUE,
+        CloseHandle, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
     use windows_sys::Win32::System::IO::{
@@ -734,9 +746,6 @@ mod iocp {
                     .state
                     .lock()
                     .map_err(|_| io::Error::other("IOCP state poisoned"))?;
-                associate(state.port, handle).map_err(|error| {
-                    io::Error::new(error.kind(), format!("IOCP associate: {error}"))
-                })?;
                 let pointer = state.buffer.as_mut_ptr();
                 overlapped_io(state.port, handle, pointer, span, base, true)?;
                 let source = &state.buffer.as_slice()[head..head + chunk];
@@ -764,9 +773,6 @@ mod iocp {
                     .state
                     .lock()
                     .map_err(|_| io::Error::other("IOCP state poisoned"))?;
-                associate(state.port, handle).map_err(|error| {
-                    io::Error::new(error.kind(), format!("IOCP associate: {error}"))
-                })?;
                 let pointer = state.buffer.as_mut_ptr();
                 state.buffer.as_mut_slice()[..span].fill(0);
                 if head != 0 || aligned_end > end {
@@ -793,37 +799,23 @@ mod iocp {
                 overlapped: true,
             }
         }
+
+        fn prepare(&self, file: &File) -> io::Result<()> {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| io::Error::other("IOCP state poisoned"))?;
+            associate(state.port, file.as_raw_handle())
+        }
     }
 
     fn associate(port: HANDLE, handle: HANDLE) -> io::Result<()> {
-        // SAFETY: both handles are live; re-associating an already associated
-        // file returns the existing port and is harmless.
-        let mut info = 0u32;
-        // SAFETY: both handles are live kernel handles owned by this backend.
-        let port_ok = unsafe { GetHandleInformation(port, &mut info) };
-        // SAFETY: `handle` is the live file handle passed by the caller.
-        let file_ok = unsafe { GetHandleInformation(handle, &mut info) };
-        eprintln!(
-            "DBG associate port={port:?} file={handle:?} port_ok={port_ok} file_ok={file_ok}"
-        );
+        // SAFETY: both handles are live. The handle is associated once, when
+        // the store opens it; re-association is rejected by some Windows
+        // versions even when the port is unchanged.
         let result = unsafe { CreateIoCompletionPort(handle, port, 0, 0) };
         if result.is_null() {
-            let error = io::Error::last_os_error();
-            // SAFETY: creates a fresh, unassociated port for diagnostics.
-            let fresh =
-                unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, ptr::null_mut(), 0, 0) };
-            // SAFETY: both handles are live for the duration of the call.
-            let retry = unsafe { CreateIoCompletionPort(handle, fresh, 0, 0) };
-            let retry_error = io::Error::last_os_error();
-            eprintln!(
-                "DBG retry fresh={fresh:?} retry_null={} retry_error={retry_error:?}",
-                retry.is_null()
-            );
-            // SAFETY: `fresh` is owned by this block.
-            unsafe {
-                CloseHandle(fresh);
-            }
-            return Err(error);
+            return Err(io::Error::last_os_error());
         }
         Ok(())
     }
@@ -869,7 +861,6 @@ mod iocp {
         if handle == INVALID_HANDLE_VALUE {
             return Err(io::Error::last_os_error());
         }
-        eprintln!("DBG iocp open {} handle={handle:?}", path.display());
         // SAFETY: `CreateFileW` returned a fresh handle owned by this function.
         Ok(unsafe { File::from_raw_handle(handle) })
     }
