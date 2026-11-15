@@ -335,8 +335,8 @@ impl Coalescer {
             self.best_bytes_per_nano = bytes_per_nano;
         }
 
-        let clearly_worse = self.best_bytes_per_nano > 0.0
-            && bytes_per_nano * 1.15 < self.best_bytes_per_nano;
+        let clearly_worse =
+            self.best_bytes_per_nano > 0.0 && bytes_per_nano * 1.15 < self.best_bytes_per_nano;
         if clearly_worse && self.target_bytes < self.max_bytes {
             self.grow();
         } else {
@@ -537,8 +537,7 @@ impl Store {
         let coalesce_batch_limit = (log_bytes / MAX_RECORD_LEN)
             .saturating_sub(capacity_pages)
             .clamp(1, MAX_FLUSH_BATCH as u64);
-        let coalesce_batch_limit =
-            usize::try_from(coalesce_batch_limit).unwrap_or(MAX_FLUSH_BATCH);
+        let coalesce_batch_limit = usize::try_from(coalesce_batch_limit).unwrap_or(MAX_FLUSH_BATCH);
         let store = Self {
             config,
             capacity_bytes: capacity_pages * PAGE_SIZE as u64,
@@ -740,10 +739,7 @@ fn scan_log(file: &File, io: &Io, superblock: &Superblock) -> Result<(HashMap<u6
 
     while offset + RECORD_HEADER_SIZE as u64 <= scan_end {
         let mut header_buffer = [0u8; RECORD_HEADER_SIZE];
-        if io
-            .read_exact_at(file, &mut header_buffer, offset)
-            .is_err()
-        {
+        if io.read_exact_at(file, &mut header_buffer, offset).is_err() {
             break;
         }
         if header_buffer.iter().all(|byte| *byte == 0) {
@@ -962,8 +958,7 @@ impl Store {
             // portable backend performs one kernel copy with no intermediate
             // userspace allocation; direct and asynchronous backends bounce
             // through their own sector-aligned transfer buffer.
-            self.io
-                .read_exact_at(file, &mut data[..], payload_offset)?;
+            self.io.read_exact_at(file, &mut data[..], payload_offset)?;
             if crc32c::crc32c(&data[..]) != header.payload_crc {
                 return Err(Error::corrupt(format!(
                     "payload checksum mismatch at {}",
@@ -1649,13 +1644,9 @@ impl Store {
             new_generation,
             self.compress,
         );
+        self.io.write_all_at(&compact, &superblock.encode(), 0)?;
         self.io
-            .write_all_at(&compact, &superblock.encode(), 0)?;
-        self.io.write_all_at(
-            &compact,
-            &[0u8; SUPERBLOCK_SIZE],
-            SUPERBLOCK_SIZE as u64,
-        )?;
+            .write_all_at(&compact, &[0u8; SUPERBLOCK_SIZE], SUPERBLOCK_SIZE as u64)?;
         compact.sync_all()?;
         drop(compact);
         drop(old_file);

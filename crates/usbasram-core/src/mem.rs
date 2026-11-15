@@ -199,13 +199,7 @@ struct HugeChunk {
 impl HugeChunk {
     fn allocate(len: usize) -> Option<(Arc<Self>, bool)> {
         let (platform, huge) = platform::allocate(len)?;
-        Some((
-            Arc::new(Self {
-                platform,
-                huge,
-            }),
-            huge,
-        ))
+        Some((Arc::new(Self { platform, huge }), huge))
     }
 
     fn len(&self) -> usize {
@@ -231,9 +225,7 @@ impl HugeChunk {
         let offset = index * PAGE_SIZE;
         debug_assert!(offset + PAGE_SIZE <= self.len());
         // SAFETY: upheld by the caller and checked by the allocation contract.
-        unsafe {
-            std::slice::from_raw_parts_mut(self.platform.as_ptr().add(offset), PAGE_SIZE)
-        }
+        unsafe { std::slice::from_raw_parts_mut(self.platform.as_ptr().add(offset), PAGE_SIZE) }
     }
 }
 
@@ -317,17 +309,11 @@ pub fn hugepages_active() -> bool {
 
 /// Whether the current platform can request large pages.
 pub fn hugepages_supported() -> bool {
-    #[cfg(all(
-        feature = "hugepages",
-        any(target_os = "linux", target_os = "windows")
-    ))]
+    #[cfg(all(feature = "hugepages", any(target_os = "linux", target_os = "windows")))]
     {
         true
     }
-    #[cfg(not(all(
-        feature = "hugepages",
-        any(target_os = "linux", target_os = "windows")
-    )))]
+    #[cfg(not(all(feature = "hugepages", any(target_os = "linux", target_os = "windows"))))]
     {
         false
     }
@@ -383,8 +369,7 @@ mod platform {
         if pointer == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        NonNull::new(pointer.cast::<u8>())
-            .ok_or_else(|| io::Error::other("mmap returned null"))
+        NonNull::new(pointer.cast::<u8>()).ok_or_else(|| io::Error::other("mmap returned null"))
     }
 
     pub(super) fn allocate(len: usize) -> Option<(Chunk, bool)> {
@@ -506,11 +491,7 @@ mod platform {
 
 /// A 4 KiB-aligned, optionally hugepage-backed scratch buffer for direct or
 /// asynchronous I/O.
-#[cfg(any(
-    feature = "direct-io",
-    feature = "io-uring",
-    feature = "iocp"
-))]
+#[cfg(any(feature = "direct-io", feature = "io-uring", feature = "iocp"))]
 pub(crate) struct AlignedBuffer {
     ptr: std::ptr::NonNull<u8>,
     len: usize,
@@ -520,24 +501,12 @@ pub(crate) struct AlignedBuffer {
     _chunk: Option<Arc<HugeChunk>>,
 }
 
-#[cfg(any(
-    feature = "direct-io",
-    feature = "io-uring",
-    feature = "iocp"
-))]
+#[cfg(any(feature = "direct-io", feature = "io-uring", feature = "iocp"))]
 unsafe impl Send for AlignedBuffer {}
-#[cfg(any(
-    feature = "direct-io",
-    feature = "io-uring",
-    feature = "iocp"
-))]
+#[cfg(any(feature = "direct-io", feature = "io-uring", feature = "iocp"))]
 unsafe impl Sync for AlignedBuffer {}
 
-#[cfg(any(
-    feature = "direct-io",
-    feature = "io-uring",
-    feature = "iocp"
-))]
+#[cfg(any(feature = "direct-io", feature = "io-uring", feature = "iocp"))]
 impl AlignedBuffer {
     pub(crate) fn new(len: usize, hugepages: bool) -> std::io::Result<Self> {
         let len = len.max(PAGE_SIZE).next_multiple_of(PAGE_SIZE);
@@ -608,11 +577,7 @@ impl AlignedBuffer {
     }
 }
 
-#[cfg(any(
-    feature = "direct-io",
-    feature = "io-uring",
-    feature = "iocp"
-))]
+#[cfg(any(feature = "direct-io", feature = "io-uring", feature = "iocp"))]
 impl Drop for AlignedBuffer {
     fn drop(&mut self) {
         if self.heap {
@@ -627,11 +592,7 @@ impl Drop for AlignedBuffer {
     }
 }
 
-#[cfg(any(
-    feature = "direct-io",
-    feature = "io-uring",
-    feature = "iocp"
-))]
+#[cfg(any(feature = "direct-io", feature = "io-uring", feature = "iocp"))]
 impl fmt::Debug for AlignedBuffer {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -663,11 +624,7 @@ mod tests {
         assert!(!source.shares_allocation(&copy));
     }
 
-    #[cfg(any(
-        feature = "direct-io",
-        feature = "io-uring",
-        feature = "iocp"
-    ))]
+    #[cfg(any(feature = "direct-io", feature = "io-uring", feature = "iocp"))]
     #[test]
     fn transfer_buffers_are_aligned() {
         let buffer = AlignedBuffer::new(8192, false).expect("buffer");

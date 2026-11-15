@@ -66,7 +66,10 @@ pub fn run(options: BenchOptions) -> Result<()> {
     } else {
         options.queue_depths.clone()
     };
-    if queue_depths.iter().any(|depth| *depth == 0 || *depth > 1024) {
+    if queue_depths
+        .iter()
+        .any(|depth| *depth == 0 || *depth > 1024)
+    {
         bail!("--queue-depths values must be between 1 and 1024");
     }
     if options.seconds <= 0.0 {
@@ -134,7 +137,12 @@ pub fn run(options: BenchOptions) -> Result<()> {
     }
 
     {
-        let store = Store::open(tuned_config(&path, options.size_bytes, cold_cache, &options))?;
+        let store = Store::open(tuned_config(
+            &path,
+            options.size_bytes,
+            cold_cache,
+            &options,
+        ))?;
         let started = Instant::now();
         let (ops, bytes) = read_phase(&store, pages, max_depth, options.seconds);
         phases.push(Phase {

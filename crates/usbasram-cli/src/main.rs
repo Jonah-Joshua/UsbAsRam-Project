@@ -322,8 +322,7 @@ fn open_existing(args: &OpenArgs) -> Result<Store> {
     let config = args
         .engine
         .apply(StoreConfig::new(&args.path, 0).with_cache_bytes(cache))?;
-    Store::open_existing_with(config)
-        .with_context(|| format!("opening {}", args.path.display()))
+    Store::open_existing_with(config).with_context(|| format!("opening {}", args.path.display()))
 }
 
 fn remove_store_files(path: &Path) -> Result<()> {

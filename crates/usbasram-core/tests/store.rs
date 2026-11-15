@@ -280,8 +280,8 @@ fn coalesced_flush_covers_multiple_batches() {
         .map(|seed| pattern(seed + 99, PAGE_SIZE))
         .collect();
     {
-        let config = config(&path, 1024, 512)
-            .with_coalescing(true, 128 * 1024, 4 * 1024 * 1024, 128 * 1024);
+        let config =
+            config(&path, 1024, 512).with_coalescing(true, 128 * 1024, 4 * 1024 * 1024, 128 * 1024);
         let store = Store::open(config).unwrap();
         for (page, page_data) in data.iter().enumerate() {
             store

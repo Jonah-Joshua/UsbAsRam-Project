@@ -181,12 +181,7 @@ impl Io {
         }
     }
 
-    pub(crate) fn read_exact_at(
-        &self,
-        file: &File,
-        buf: &mut [u8],
-        offset: u64,
-    ) -> io::Result<()> {
+    pub(crate) fn read_exact_at(&self, file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
         self.backend.read_exact_at(file, buf, offset)
     }
 
@@ -532,7 +527,8 @@ mod uring {
                         submit_read(&mut state.ring, fd, base, existing, pointer)?;
                     }
                 }
-                state.buffer.as_mut_slice()[head..head + chunk].copy_from_slice(&buf[done..done + chunk]);
+                state.buffer.as_mut_slice()[head..head + chunk]
+                    .copy_from_slice(&buf[done..done + chunk]);
                 submit_write(&mut state.ring, fd, base, span, pointer)?;
                 file_len = file_len.max(aligned_end);
                 done += chunk;
@@ -558,14 +554,9 @@ mod uring {
         mut pointer: *mut u8,
     ) -> io::Result<()> {
         while len > 0 {
-            let entry = opcode::ReadFixed::new(
-                types::Fd(fd),
-                pointer,
-                len as u32,
-                BUFFER_INDEX,
-            )
-            .offset(offset)
-            .build();
+            let entry = opcode::ReadFixed::new(types::Fd(fd), pointer, len as u32, BUFFER_INDEX)
+                .offset(offset)
+                .build();
             // SAFETY: the kernel reads from the registered buffer, which is
             // owned by the caller and remains valid until the completion is
             // reaped before this function returns.
@@ -596,14 +587,9 @@ mod uring {
         mut pointer: *mut u8,
     ) -> io::Result<()> {
         while len > 0 {
-            let entry = opcode::WriteFixed::new(
-                types::Fd(fd),
-                pointer,
-                len as u32,
-                BUFFER_INDEX,
-            )
-            .offset(offset)
-            .build();
+            let entry = opcode::WriteFixed::new(types::Fd(fd), pointer, len as u32, BUFFER_INDEX)
+                .offset(offset)
+                .build();
             // SAFETY: same contract as `submit_read`.
             let written = unsafe { push_and_wait(ring, &entry)? };
             if written == 0 {
@@ -712,9 +698,8 @@ mod iocp {
         pub(super) fn new(hugepages: bool) -> Option<Self> {
             let buffer = AlignedBuffer::new(BUFFER_BYTES, hugepages).ok()?;
             // SAFETY: INVALID_HANDLE_VALUE creates a new, unassociated port.
-            let port = unsafe {
-                CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 0)
-            };
+            let port =
+                unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 0) };
             if port.is_null() || port == INVALID_HANDLE_VALUE {
                 return None;
             }
@@ -777,7 +762,8 @@ mod iocp {
                         overlapped_io(state.port, handle, pointer, existing, base, true)?;
                     }
                 }
-                state.buffer.as_mut_slice()[head..head + chunk].copy_from_slice(&buf[done..done + chunk]);
+                state.buffer.as_mut_slice()[head..head + chunk]
+                    .copy_from_slice(&buf[done..done + chunk]);
                 overlapped_io(state.port, handle, pointer, span, base, false)?;
                 file_len = file_len.max(aligned_end);
                 done += chunk;
@@ -835,7 +821,13 @@ mod iocp {
                     &mut overlapped,
                 )
             } else {
-                WriteFile(handle, pointer.cast(), len as u32, &mut transferred, &mut overlapped)
+                WriteFile(
+                    handle,
+                    pointer.cast(),
+                    len as u32,
+                    &mut transferred,
+                    &mut overlapped,
+                )
             }
         };
         if started == 0 {
@@ -856,7 +848,13 @@ mod iocp {
             // SAFETY: the port is live and `completed` receives a completion
             // packet owned by this backend.
             let ok = unsafe {
-                GetQueuedCompletionStatus(port, &mut transferred, &mut key, &mut completed, INFINITE)
+                GetQueuedCompletionStatus(
+                    port,
+                    &mut transferred,
+                    &mut key,
+                    &mut completed,
+                    INFINITE,
+                )
             };
             if completed.is_null() {
                 return Err(io::Error::last_os_error());
