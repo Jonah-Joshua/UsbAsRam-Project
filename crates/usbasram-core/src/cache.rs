@@ -102,7 +102,11 @@ impl Shard {
 
     pub(crate) fn remove(&mut self, page_no: u64) -> Option<CachePage> {
         let page = self.pages.remove(&page_no)?;
-        if let Some(position) = self.clock.iter().position(|candidate| *candidate == page_no) {
+        if let Some(position) = self
+            .clock
+            .iter()
+            .position(|candidate| *candidate == page_no)
+        {
             self.clock.swap_remove(position);
             if self.hand >= self.clock.len() {
                 self.hand = 0;
@@ -184,11 +188,7 @@ impl Shard {
                 continue;
             };
             if page.dirty {
-                return Some((
-                    page_no,
-                    Box::new(AlignedPage(page.data.0)),
-                    page.generation,
-                ));
+                return Some((page_no, Box::new(AlignedPage(page.data.0)), page.generation));
             }
         }
         None

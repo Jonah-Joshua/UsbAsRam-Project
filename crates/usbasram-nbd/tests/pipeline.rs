@@ -81,7 +81,11 @@ fn pipelined_reads_and_writes_are_processed_concurrently() {
         assert!(index < read_count);
         client.read_exact(&mut buffer).unwrap();
         let page = index % write_pages;
-        assert_eq!(buffer, page_data(page), "cookie {cookie} returned wrong data");
+        assert_eq!(
+            buffer,
+            page_data(page),
+            "cookie {cookie} returned wrong data"
+        );
         read_replies[index] = true;
     }
     assert!(read_replies.iter().all(|seen| *seen));

@@ -1180,8 +1180,7 @@ impl Store {
             batch.resize(start + record_len, 0);
             batch[start..start + RECORD_HEADER_SIZE].copy_from_slice(&header.encode());
             let payload_start = start + RECORD_HEADER_SIZE;
-            batch[payload_start..payload_start + page.payload.len()]
-                .copy_from_slice(&page.payload);
+            batch[payload_start..payload_start + page.payload.len()].copy_from_slice(&page.payload);
             extents.push(Extent {
                 offset,
                 stored_len: header.stored_len,
@@ -1428,12 +1427,7 @@ impl Store {
 /// Compress (or copy) one page payload and checksum it. The result is
 /// independent of the log epoch, which lets callers encode a whole batch in
 /// parallel before taking the writer lock.
-fn encode_page(
-    page_no: u64,
-    data: &[u8],
-    generation: u64,
-    compress: bool,
-) -> Result<EncodedPage> {
+fn encode_page(page_no: u64, data: &[u8], generation: u64, compress: bool) -> Result<EncodedPage> {
     if data.len() != PAGE_SIZE {
         return Err(Error::Config(
             "page writes must be exactly 4096 bytes".into(),
