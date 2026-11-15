@@ -19,19 +19,32 @@ jobs:
             [DllImport("kernel32.dll", SetLastError=true)]
             public static extern IntPtr CreateIoCompletionPort(IntPtr file, IntPtr port, UIntPtr key, uint threads);
             [DllImport("kernel32.dll", SetLastError=true)]
+            public static extern bool SetFileInformationByHandle(IntPtr file, int cls, ref FILE_END_OF_FILE_INFO info, uint size);
+            [DllImport("kernel32.dll", SetLastError=true)]
+            public static extern bool SetEndOfFile(IntPtr file);
+            [DllImport("kernel32.dll", SetLastError=true)]
             public static extern bool CloseHandle(IntPtr h);
-            public static string Run(string path, uint flags) {
+            [StructLayout(LayoutKind.Sequential)]
+            public struct FILE_END_OF_FILE_INFO { public long EndOfFile; }
+            public static string Run(string path, uint flags, int mode) {
               const uint GENERIC_READ=0x80000000, GENERIC_WRITE=0x40000000;
               const uint FILE_SHARE_READ=1, FILE_SHARE_WRITE=2, FILE_SHARE_DELETE=4;
               const uint OPEN_ALWAYS=4;
               IntPtr file=CreateFileW(path, GENERIC_READ|GENERIC_WRITE, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, IntPtr.Zero, OPEN_ALWAYS, flags, IntPtr.Zero);
               if (file==new IntPtr(-1)) return "CreateFile failed " + Marshal.GetLastWin32Error();
+              string resize = "";
+              if (mode == 1 || mode == 3) {
+                var info = new FILE_END_OF_FILE_INFO { EndOfFile = 8192 };
+                bool ok = SetFileInformationByHandle(file, 6, ref info, (uint)Marshal.SizeOf(info));
+                resize = " seteof=" + ok + "/" + Marshal.GetLastWin32Error();
+              }
               IntPtr port=CreateIoCompletionPort(new IntPtr(-1), IntPtr.Zero, UIntPtr.Zero, 0);
-              if (port==IntPtr.Zero) { int e=Marshal.GetLastWin32Error(); CloseHandle(file); return "CreatePort failed " + e; }
+              if (port==IntPtr.Zero) { int e=Marshal.GetLastWin32Error(); CloseHandle(file); return "CreatePort failed " + e + resize; }
               IntPtr assoc=CreateIoCompletionPort(file, port, UIntPtr.Zero, 0);
               int assocErr=Marshal.GetLastWin32Error();
+              if (mode == 2) resize = " then-seteof=" + SetEndOfFile(file) + "/" + Marshal.GetLastWin32Error();
               CloseHandle(port); CloseHandle(file);
-              return "assoc=" + (assoc!=IntPtr.Zero) + " err=" + assocErr;
+              return "assoc=" + (assoc!=IntPtr.Zero) + " err=" + assocErr + resize;
             }
           }
           '@
@@ -41,8 +54,10 @@ jobs:
             (Join-Path $env:SystemDrive 'probe-c.bin')
           )
           foreach ($path in $paths) {
-            foreach ($flags in @(0x40000000, 0x60000000)) {
-              Remove-Item $path -ErrorAction SilentlyContinue
-              Write-Output ("{0} flags={1:X8} => {2}" -f $path, $flags, [Probe]::Run($path, $flags))
+            foreach ($flags in @(0x40000000, 0x60000000, 0x60000080)) {
+              foreach ($mode in @(0, 1, 2)) {
+                Remove-Item $path -ErrorAction SilentlyContinue
+                Write-Output ("{0} flags={1:X8} mode={2} => {3}" -f $path, $flags, $mode, [Probe]::Run($path, $flags, $mode))
+              }
             }
           }
