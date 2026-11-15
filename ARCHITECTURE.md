@@ -25,9 +25,10 @@ NBD.
 ```text
 ┌─────────────────────────────────────────────────────────────┐
 │ Hot tier: sharded CLOCK page cache in RAM                   │
-│ - 4 KiB pages                                               │
-│ - dirty / referenced bits                                   │
-│ - per-page generation                                       │
+│ - 4 KiB-aligned pages, 128-byte aligned shard locks         │
+│ - shared read locks, exclusive write locks                  │
+│ - dirty / atomic referenced bits, per-page generation       │
+│ - per-shard free list for page-buffer recycling             │
 └───────────────────────────┬─────────────────────────────────┘
                             │ eviction or explicit flush
 ┌───────────────────────────▼─────────────────────────────────┐
@@ -116,31 +117,45 @@ A record's total length is `align_up(48 + stored_len, 8)`.
 ## 4. Write path
 
 1. Locate the page and page offset.
-2. Allocate a generation with `fetch_add`.
-3. If the write covers a whole page, replace the cache entry under its shard
-   lock. Otherwise, read the current page (cache or cold tier), modify the
-   requested range, and publish the new page under the same shard lock.
+2. If the page is cached, take the shard's write lock, allocate a generation,
+   copy the full page or apply the sub-page range, mark it dirty, and return.
+   Allocating the generation while holding the shard lock is what makes the
+   generation order match the page order.
+3. On a partial-page miss, load the old page without holding the shard lock,
+   then retry under the lock. If another writer inserted the page meanwhile,
+   the modification is replayed against the now-cached page.
 4. Mark the page dirty. The write is now visible to readers.
-5. On eviction or flush, compress the page if enabled and LZ4 produces a
-   smaller payload. Append a record to the log.
-6. `fsync` the record data, then commit a new superblock checkpoint with the new
+5. On eviction or flush, snapshot dirty payloads, compress them in parallel,
+   then append the batch to the log.
+6. `fsync` the batch, then commit a new superblock checkpoint with the new
    head. Only then is the write durable.
 
-The cache is sharded. Each shard has its own `Mutex` and a CLOCK (second-chance)
-eviction hand. A dirty victim is written to the cold log before its slot is
-reused. If the write fails, the victim is put back and the insertion fails.
+The cache is sharded. Each shard is a `RwLock` padded to 128 bytes, so readers
+on different shards never share a cache line and readers on the same shard run
+concurrently. A CLOCK (second-chance) hand selects clean victims. A dirty victim
+is snapshotted and appended while the shard lock is released; the page stays
+visible in the cache until the append commits, at which point it is removed or
+marked clean. This prevents a reader from observing the older cold copy and
+keeps `fsync` latency out of the shard lock.
 
 ## 5. Read path
 
-1. Look up the page in the cache shard. A hit copies the requested range and
-   marks the page referenced.
+1. Look up the page in the cache shard under a shared lock. A hit marks the page
+   referenced with an atomic store, copies the requested range, and returns.
+   Readers do not serialize against each other.
 2. On a miss, take a file read lock, then the index read lock, and find the
    newest extent for the page.
 3. If there is no extent, the page is zero-filled.
-4. Otherwise read the record, verify the header CRC and payload CRC32C, verify
-   that the header matches the index, and decompress if needed.
-5. Insert the clean page into the cache (evicting a victim if necessary) and
-   copy the requested range.
+4. Otherwise read the record header, verify the header CRC and payload CRC32C,
+   and verify that the header matches the index.
+5. Uncompressed payloads are read directly into the 4 KiB-aligned cache page.
+   Compressed payloads use a per-call 5 KiB stack buffer and are decompressed
+   into the aligned page.
+6. Publish the clean page under the index read lock and copy the requested range
+   while the shard's write lock is held. If the index moved on, or a newer page
+   is already cached, discard the loaded page and retry. This prevents a cold
+   read that raced with a flush and an eviction from installing a stale clean
+   page or returning stale data.
 
 Taking the file lock before the index lock is important: compaction takes the
 file write lock before replacing the index, so a reader cannot resolve an extent
@@ -156,12 +171,19 @@ prevents a continuous writer from making flush run forever.
 For each batch:
 
 1. Reserve log space. If the batch does not fit, compact first.
-2. Append each record.
-3. `fsync` the record data.
-4. Write and `fsync` the inactive superblock slot.
-5. Publish the new extents in the index while still holding the writer lock.
-6. Clear the dirty bit only if the page generation still matches the flushed
+2. Compress and checksum every payload in parallel with the work-stealing pool.
+   Payload encoding is independent of the log epoch, so this happens before the
+   writer lock is taken.
+3. Build one contiguous record batch under the writer lock, using the current
+   epoch for the headers, and issue one positioned write.
+4. `fsync` the record data.
+5. Write and `fsync` the inactive superblock slot.
+6. Publish the new extents in the index while still holding the writer lock.
+7. Clear the dirty bit only if the page generation still matches the flushed
    generation.
+
+Flush callers are serialized by a dedicated flush mutex, so two flushers cannot
+append the same dirty batch twice. Hot reads and writes never take that mutex.
 
 If a checkpoint fails, the writer records that a checkpoint is still needed and
 returns the error. The next flush retries it. Even if the process crashes before
@@ -217,28 +239,48 @@ A valid superblock is not enough to prove that the whole store is healthy. Run
 
 ## 9. Concurrency model
 
-Locks are ordered to avoid deadlocks:
+The lock order for operations that take more than one of the log locks is:
 
 ```text
-cache shard -> writer -> file -> index
+writer -> file -> index
 ```
+
+Cache shard locks are normally acquired alone; no shard lock is held while
+taking the writer, file, or index lock. This keeps `fsync` and compaction off
+the hot path.
+
+The one exception is the cold-fill path. It holds the index read lock while
+taking the destination shard's write lock:
+
+```text
+index (read) -> cache shard (write)
+```
+
+This makes "the index still names the generation I loaded" and "the cache does
+not already have a newer page" a single atomic decision. It is safe because the
+cold-fill path never takes the writer or file lock, and no other path holds a
+shard lock while waiting for the index.
 
 Rules:
 
-- Never acquire a cache shard while holding the index lock.
+- Never acquire the writer or file lock while holding a cache shard lock.
 - Never acquire the writer lock while holding the file lock.
 - Compaction holds the writer and file write locks while replacing the file and
   the index.
 - Appends publish index entries while still holding the writer lock, so a
   compaction cannot replace the index between an append and its visibility.
-- Partial-page writes hold the shard lock across the read-modify-write, which
-  prevents a concurrent full-page write from being lost.
+- Partial-page writes load cold data before taking the shard lock. If a full-page
+  write wins the race, the partial update is replayed on the cached page. If a
+  flush publishes a newer record while the cold load is in flight, the index
+  generation is rechecked and the partial update is replayed on the newer body,
+  so no update is lost and an older body cannot be resurrected.
 - `verify` holds the writer and a file read lock for the whole scan, so the head
   and file cannot change underneath it.
 
-The cache itself is sharded, so unrelated pages do not contend on one global
-mutex. The writer lock serializes log appends but is not taken by hot reads or
-full-page cache writes.
+The cache is sharded into power-of-two buckets selected by the page number.
+Each bucket is an `RwLock<Shard>` aligned to 128 bytes. Hot reads take shared
+locks and do not contend with each other. The writer lock serializes log
+appends but is not taken by hot reads or full-page cache writes.
 
 ## 10. NBD server
 
@@ -251,9 +293,24 @@ The server implements NBD fixed-newstyle negotiation:
 - `FUA` on writes and zeroing requests.
 - Advertised block sizes: minimum 1 byte, preferred 4096, maximum 32 MiB.
 
+Each connection has a reader thread that parses requests and submits jobs to a
+bounded MPMC queue. A fixed pool of workers, sized to the hardware thread
+count, executes the jobs. Replies are framed under a per-connection writer
+mutex. NBD cookies make out-of-order replies legal, so a single pipelining client
+can keep every worker busy. READ jobs reuse one reply buffer per worker; WRITE
+jobs own their payload buffer until the write completes.
+
+The NBD specification allows out-of-order command processing. `FLUSH` and `FUA`
+are the exceptions: the reader drains the connection's outstanding requests
+before executing them, then calls `Store::flush` before replying. A write batch
+that a client completes before a flush is therefore covered by that flush. As
+the specification requires, clients must not pipeline overlapping writes without
+ordering; independent pages are safe to pipeline.
+
 `TRIM` and `WRITE_ZEROES` are implemented as zeroing writes. They are visible
 immediately and become durable on the next flush. The server advertises
-multi-connection support because all connections share one store.
+multi-connection support because all connections share one store and a flush
+covers writes from every connection.
 
 ## 11. Why this cannot beat DDR3
 

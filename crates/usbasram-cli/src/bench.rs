@@ -54,6 +54,8 @@ pub fn run(options: BenchOptions) -> Result<()> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("bench.usr");
     let mut phases = Vec::new();
+    let mut hot_p50_ns = 0u64;
+    let mut hot_p99_ns = 0u64;
 
     {
         let store = Store::open(
@@ -73,6 +75,9 @@ pub fn run(options: BenchOptions) -> Result<()> {
             bytes,
             elapsed: started.elapsed(),
         });
+        let (p50_ns, p99_ns) = read_latency(&store, pages, 20_000);
+        hot_p50_ns = p50_ns;
+        hot_p99_ns = p99_ns;
 
         let started = Instant::now();
         let (ops, bytes) = write_phase(&store, pages, options.threads, options.seconds);
@@ -100,11 +105,13 @@ pub fn run(options: BenchOptions) -> Result<()> {
 
     if options.json {
         println!(
-            "{{\"size_bytes\":{},\"hot_cache_bytes\":{},\"cold_cache_bytes\":{},\"threads\":{},\"phases\":[{}]}}",
+            "{{\"size_bytes\":{},\"hot_cache_bytes\":{},\"cold_cache_bytes\":{},\"threads\":{},\"hot_read_p50_ns\":{},\"hot_read_p99_ns\":{},\"phases\":[{}]}}",
             options.size_bytes,
             options.size_bytes,
             cold_cache,
             options.threads,
+            hot_p50_ns,
+            hot_p99_ns,
             phases
                 .iter()
                 .map(|phase| format!(
@@ -146,9 +153,40 @@ pub fn run(options: BenchOptions) -> Result<()> {
     }
     println!();
     println!(
+        "  hot read latency: p50 {} ns, p99 {} ns",
+        hot_p50_ns, hot_p99_ns
+    );
+    println!(
         "  Note: hot phases are RAM-cache hits. cold_read is bounded by the backing file/device."
     );
     Ok(())
+}
+
+fn read_latency(store: &Store, pages: u64, samples: usize) -> (u64, u64) {
+    let mut rng = Rng::new(0x1a7e_11ce);
+    let mut buffer = [0u8; PAGE_SIZE];
+    // Warm the cache path before recording.
+    for _ in 0..2048 {
+        let page = rng.next() % pages;
+        let _ = store.read_at(page * PAGE_SIZE as u64, &mut buffer);
+    }
+    let mut timings = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        let page = rng.next() % pages;
+        let started = Instant::now();
+        store
+            .read_at(page * PAGE_SIZE as u64, &mut buffer)
+            .expect("latency read failed");
+        timings.push(started.elapsed().as_nanos() as u64);
+    }
+    black_box(&buffer);
+    timings.sort_unstable();
+    if timings.is_empty() {
+        return (0, 0);
+    }
+    let p50 = timings[timings.len() / 2];
+    let p99 = timings[(timings.len() - 1) * 99 / 100];
+    (p50, p99)
 }
 
 fn read_phase(store: &Store, pages: u64, threads: usize, seconds: f64) -> (u64, u64) {

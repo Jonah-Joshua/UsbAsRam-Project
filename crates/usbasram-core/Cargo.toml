@@ -12,6 +12,7 @@ authors.workspace = true
 crc32c.workspace = true
 lz4_flex.workspace = true
 parking_lot.workspace = true
+rayon.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

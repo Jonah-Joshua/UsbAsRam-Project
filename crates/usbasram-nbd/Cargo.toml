@@ -9,6 +9,8 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
 usbasram-core.workspace = true
 
 [dev-dependencies]

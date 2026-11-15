@@ -1,15 +1,19 @@
-//! A small, dependency-free NBD (Network Block Device) server.
+//! A small, pipelined NBD (Network Block Device) server.
 //!
 //! The server implements fixed-newstyle negotiation, `NBD_OPT_LIST`,
 //! `NBD_OPT_INFO`, `NBD_OPT_GO`, and simple replies. It advertises flush, FUA,
-//! trim, write-zeroes, and multi-connection support.
+//! trim, write-zeroes, and multi-connection support. Requests from every
+//! connection are executed by a shared thread-per-core worker pool.
 #![forbid(unsafe_code)]
 
 use std::io::{self, Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
+use crossbeam_channel::{bounded, Receiver, Sender};
+use parking_lot::{Condvar, Mutex};
 use usbasram_core::{Error as StoreError, Store};
 
 const NBDMAGIC: u64 = 0x4e42_444d_4147_4943;
@@ -69,21 +73,275 @@ const ENOTSUP: u32 = 95;
 const MAX_OPTION_LEN: u32 = 1024 * 1024;
 const MAX_REQUEST_LEN: u32 = 32 * 1024 * 1024;
 
-/// Serve NBD over TCP forever, one thread per connection.
+trait CloneStream: Read + Write + Send + Sized + 'static {
+    fn try_clone_stream(&self) -> io::Result<Self>;
+}
+
+impl CloneStream for TcpStream {
+    fn try_clone_stream(&self) -> io::Result<Self> {
+        self.try_clone()
+    }
+}
+
+#[cfg(unix)]
+impl CloneStream for std::os::unix::net::UnixStream {
+    fn try_clone_stream(&self) -> io::Result<Self> {
+        self.try_clone()
+    }
+}
+
+/// Number of request-processing workers. One worker per hardware thread keeps
+/// the data plane saturated without oversubscribing the CPU.
+fn worker_count() -> usize {
+    thread::available_parallelism()
+        .map_or(4, |value| value.get())
+        .max(1)
+}
+
+/// Per-connection completion tracking.
+///
+/// Normal reads and writes pipeline freely. `FLUSH` and `FUA` need a barrier:
+/// they may only run after every earlier request on the same connection has
+/// completed. The reader stops submitting while it waits, so the outstanding
+/// count cannot grow underneath the barrier.
+struct ConnState {
+    outstanding: AtomicUsize,
+    waiters: Mutex<()>,
+    ready: Condvar,
+}
+
+impl ConnState {
+    fn new() -> Self {
+        Self {
+            outstanding: AtomicUsize::new(0),
+            waiters: Mutex::new(()),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn enter(&self) {
+        self.outstanding.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn leave(&self) {
+        if self.outstanding.fetch_sub(1, Ordering::SeqCst) == 1 {
+            let _guard = self.waiters.lock();
+            self.ready.notify_all();
+        }
+    }
+
+    fn wait_idle(&self) {
+        let mut guard = self.waiters.lock();
+        while self.outstanding.load(Ordering::SeqCst) != 0 {
+            self.ready.wait(&mut guard);
+        }
+    }
+}
+
+/// Bounds the total bytes of WRITE payloads queued across all connections.
+///
+/// The job count alone is not enough: a client may pipeline 32 MiB writes, so
+/// the queue needs a byte budget as well as a slot budget.
+const MAX_QUEUED_WRITE_BYTES: usize = 64 * 1024 * 1024;
+
+struct Budget {
+    queued: AtomicUsize,
+    limit: usize,
+    waiters: Mutex<()>,
+    ready: Condvar,
+}
+
+impl Budget {
+    fn new(limit: usize) -> Self {
+        Self {
+            queued: AtomicUsize::new(0),
+            limit,
+            waiters: Mutex::new(()),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn reserve(&self, bytes: usize) {
+        let mut guard = self.waiters.lock();
+        while self.queued.load(Ordering::SeqCst).saturating_add(bytes) > self.limit {
+            self.ready.wait(&mut guard);
+        }
+        self.queued.fetch_add(bytes, Ordering::SeqCst);
+    }
+
+    fn release(&self, bytes: usize) {
+        self.queued.fetch_sub(bytes, Ordering::SeqCst);
+        let _guard = self.waiters.lock();
+        self.ready.notify_all();
+    }
+}
+
+/// A bounded multi-producer, multi-consumer submission queue shared by every
+/// connection.
+///
+/// The accept path only spawns a reader per connection. Block/READ/TRIM work is
+/// pushed into this queue and executed by a fixed pool of workers, so a single
+/// pipelining client can use every core and multiple clients share one pool.
+struct Engine<W: Write + Send + 'static> {
+    sender: Sender<Job<W>>,
+    budget: Arc<Budget>,
+}
+
+impl<W: Write + Send + 'static> Engine<W> {
+    fn new(store: Arc<Store>, workers: usize) -> io::Result<Self> {
+        let workers = workers.max(1);
+        let (sender, receiver) = bounded::<Job<W>>(workers * 256);
+        let budget = Arc::new(Budget::new(MAX_QUEUED_WRITE_BYTES));
+        for index in 0..workers {
+            let receiver = receiver.clone();
+            let store = Arc::clone(&store);
+            let budget = Arc::clone(&budget);
+            thread::Builder::new()
+                .name(format!("usbasram-io-{index}"))
+                .spawn(move || worker_loop(&receiver, store.as_ref(), &budget))?;
+        }
+        Ok(Self { sender, budget })
+    }
+
+    fn submit(&self, job: Job<W>) -> io::Result<()> {
+        let bytes = job.data.len();
+        self.budget.reserve(bytes);
+        if let Err(error) = self.sender.send(job) {
+            self.budget.release(bytes);
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("I/O worker pool is closed: {error}"),
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct Job<W: Write + Send + 'static> {
+    command: u16,
+    cookie: u64,
+    offset: u64,
+    length: u32,
+    fua: bool,
+    data: Vec<u8>,
+    writer: Arc<Mutex<W>>,
+    state: Arc<ConnState>,
+}
+
+fn worker_loop<W: Write + Send + 'static>(
+    receiver: &Receiver<Job<W>>,
+    store: &Store,
+    budget: &Budget,
+) {
+    // One reusable reply buffer per worker. READ replies are written to the
+    // socket before the next job is taken, so the buffer never needs to escape
+    // the worker.
+    let mut scratch = Vec::new();
+    while let Ok(job) = receiver.recv() {
+        let state = Arc::clone(&job.state);
+        let bytes = job.data.len();
+        process_job(job, store, &mut scratch);
+        budget.release(bytes);
+        state.leave();
+    }
+}
+
+fn process_job<W: Write + Send + 'static>(job: Job<W>, store: &Store, scratch: &mut Vec<u8>) {
+    let length = job.length as usize;
+    match job.command {
+        CMD_READ => {
+            scratch.resize(length, 0);
+            let result = match store.read_at(job.offset, &mut scratch[..]) {
+                Ok(read) if read == length => {
+                    send_reply(&job.writer, 0, job.cookie, Some(&scratch[..]))
+                }
+                Ok(_) => send_reply(&job.writer, EIO, job.cookie, None),
+                Err(error) => send_reply(&job.writer, store_error(&error), job.cookie, None),
+            };
+            let _ = result;
+        }
+        CMD_WRITE => {
+            let result = store.write_at(job.offset, &job.data).and_then(|written| {
+                if written != job.data.len() {
+                    return Err(StoreError::Config("short write".into()));
+                }
+                if job.fua {
+                    store.flush()?;
+                }
+                Ok(())
+            });
+            let _ = match result {
+                Ok(()) => send_reply(&job.writer, 0, job.cookie, None),
+                Err(error) => send_reply(&job.writer, store_error(&error), job.cookie, None),
+            };
+        }
+        CMD_FLUSH => {
+            let _ = match store.flush() {
+                Ok(()) => send_reply(&job.writer, 0, job.cookie, None),
+                Err(error) => send_reply(&job.writer, store_error(&error), job.cookie, None),
+            };
+        }
+        CMD_TRIM | CMD_WRITE_ZEROES => {
+            let result = store.trim(job.offset, job.length as u64).and_then(|()| {
+                if job.fua {
+                    store.flush()?;
+                }
+                Ok(())
+            });
+            let _ = match result {
+                Ok(()) => send_reply(&job.writer, 0, job.cookie, None),
+                Err(error) => send_reply(&job.writer, store_error(&error), job.cookie, None),
+            };
+        }
+        _ => {
+            let _ = send_reply(&job.writer, ENOTSUP, job.cookie, None);
+        }
+    }
+}
+
+fn serve_connection<S: CloneStream>(
+    mut stream: S,
+    engine: Arc<Engine<S>>,
+    store: Arc<Store>,
+    export_name: String,
+    capacity: u64,
+) -> io::Result<()> {
+    if !negotiate(&mut stream, capacity, &export_name)? {
+        return Ok(());
+    }
+    let reader = stream.try_clone_stream()?;
+    let writer = Arc::new(Mutex::new(stream));
+    let state = Arc::new(ConnState::new());
+    transmission_pipelined(reader, writer, &engine, store.as_ref(), &state, capacity)
+}
+
+/// Serve NBD over TCP forever.
+///
+/// Each connection has one reader thread; requests are executed by the shared
+/// worker pool and replies are serialized per connection. NBD cookies make
+/// out-of-order replies legal, so independent requests truly run in parallel.
 pub fn serve_tcp(
     listener: TcpListener,
     store: Arc<Store>,
     export_name: impl Into<String>,
 ) -> io::Result<()> {
     let export_name = export_name.into();
+    let capacity = store.capacity_bytes();
+    let engine = Arc::new(Engine::<TcpStream>::new(
+        Arc::clone(&store),
+        worker_count(),
+    )?);
     for connection in listener.incoming() {
         match connection {
             Ok(stream) => {
                 let _ = stream.set_nodelay(true);
-                let store = Arc::clone(&store);
                 let export_name = export_name.clone();
+                let engine = Arc::clone(&engine);
+                let store = Arc::clone(&store);
                 thread::spawn(move || {
-                    if let Err(error) = handle_connection(stream, &store, &export_name) {
+                    if let Err(error) =
+                        serve_connection(stream, engine, store, export_name, capacity)
+                    {
                         eprintln!("usbasram-nbd: connection ended: {error}");
                     }
                 });
@@ -102,12 +360,18 @@ pub fn serve_unix(
     export_name: impl Into<String>,
 ) -> io::Result<()> {
     let export_name = export_name.into();
+    let capacity = store.capacity_bytes();
+    let engine = Arc::new(Engine::<std::os::unix::net::UnixStream>::new(
+        Arc::clone(&store),
+        worker_count(),
+    )?);
     for connection in listener.incoming() {
         let stream = connection?;
-        let store = Arc::clone(&store);
         let export_name = export_name.clone();
+        let engine = Arc::clone(&engine);
+        let store = Arc::clone(&store);
         thread::spawn(move || {
-            if let Err(error) = handle_connection(stream, &store, &export_name) {
+            if let Err(error) = serve_connection(stream, engine, store, export_name, capacity) {
                 eprintln!("usbasram-nbd: connection ended: {error}");
             }
         });
@@ -368,6 +632,139 @@ fn transmission<S: Read + Write>(stream: &mut S, store: &Store) -> io::Result<()
             _ => send_simple_reply(stream, ENOTSUP, cookie, None)?,
         }
     }
+}
+
+/// Pipelined transmission: one reader dispatches jobs, workers execute them,
+/// and replies are framed under a per-connection writer lock.
+fn transmission_pipelined<R, W>(
+    mut reader: R,
+    writer: Arc<Mutex<W>>,
+    engine: &Engine<W>,
+    store: &Store,
+    state: &Arc<ConnState>,
+    capacity: u64,
+) -> io::Result<()>
+where
+    R: Read,
+    W: Write + Send + 'static,
+{
+    let mut header = [0u8; 28];
+    loop {
+        match reader.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        let magic = u32::from_be_bytes(header[0..4].try_into().expect("fixed slice"));
+        if magic != REQUEST_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid NBD request magic",
+            ));
+        }
+        let flags = u16::from_be_bytes(header[4..6].try_into().expect("fixed slice"));
+        let command = u16::from_be_bytes(header[6..8].try_into().expect("fixed slice"));
+        let cookie = u64::from_be_bytes(header[8..16].try_into().expect("fixed slice"));
+        let offset = u64::from_be_bytes(header[16..24].try_into().expect("fixed slice"));
+        let length = u32::from_be_bytes(header[24..28].try_into().expect("fixed slice"));
+
+        if command == CMD_DISC {
+            return Ok(());
+        }
+        if length > MAX_REQUEST_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "request payload is too large",
+            ));
+        }
+
+        let in_range = offset
+            .checked_add(length as u64)
+            .map(|end| end <= capacity)
+            .unwrap_or(false);
+        let fua = flags & CMD_FLAG_FUA != 0;
+
+        let mut data = Vec::new();
+        if command == CMD_WRITE {
+            data = vec![0u8; length as usize];
+            reader.read_exact(&mut data)?;
+            if !in_range {
+                send_reply(&writer, EINVAL, cookie, None)?;
+                continue;
+            }
+            if fua {
+                // A write barrier is rare (journal commits). Execute it after
+                // all earlier requests on this connection have completed.
+                state.wait_idle();
+                let result = store.write_at(offset, &data).and_then(|written| {
+                    if written != data.len() {
+                        return Err(StoreError::Config("short write".into()));
+                    }
+                    store.flush()?;
+                    Ok(())
+                });
+                match result {
+                    Ok(()) => send_reply(&writer, 0, cookie, None)?,
+                    Err(error) => {
+                        send_reply(&writer, store_error(&error), cookie, None)?;
+                    }
+                }
+                continue;
+            }
+        } else if matches!(command, CMD_READ | CMD_TRIM | CMD_WRITE_ZEROES) && !in_range {
+            send_reply(&writer, EINVAL, cookie, None)?;
+            continue;
+        }
+
+        if command == CMD_FLUSH {
+            state.wait_idle();
+            match store.flush() {
+                Ok(()) => send_reply(&writer, 0, cookie, None)?,
+                Err(error) => {
+                    send_reply(&writer, store_error(&error), cookie, None)?;
+                }
+            }
+            continue;
+        }
+        if fua && matches!(command, CMD_TRIM | CMD_WRITE_ZEROES) {
+            state.wait_idle();
+            let result = store
+                .trim(offset, length as u64)
+                .and_then(|()| store.flush());
+            match result {
+                Ok(()) => send_reply(&writer, 0, cookie, None)?,
+                Err(error) => {
+                    send_reply(&writer, store_error(&error), cookie, None)?;
+                }
+            }
+            continue;
+        }
+
+        state.enter();
+        if let Err(error) = engine.submit(Job {
+            command,
+            cookie,
+            offset,
+            length,
+            fua,
+            data,
+            writer: Arc::clone(&writer),
+            state: Arc::clone(state),
+        }) {
+            state.leave();
+            return Err(error);
+        }
+    }
+}
+
+fn send_reply<W: Write>(
+    writer: &Arc<Mutex<W>>,
+    error: u32,
+    cookie: u64,
+    data: Option<&[u8]>,
+) -> io::Result<()> {
+    let mut writer = writer.lock();
+    send_simple_reply(&mut *writer, error, cookie, data)
 }
 
 fn send_simple_reply<S: Write>(

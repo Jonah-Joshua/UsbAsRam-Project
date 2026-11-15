@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::{Mutex, RwLock};
+use rayon::prelude::*;
 
-use crate::cache::{CachePage, PageCache, Shard};
+use crate::cache::{AlignedPage, CachePage, PageCache};
 use crate::error::{Error, Result};
 use crate::format::{
     RecordHeader, Superblock, DATA_OFFSET, MAX_STORED_LEN, RECORD_FLAG_COMPRESSED,
@@ -18,9 +19,21 @@ use crate::PAGE_SIZE;
 const MAX_FLUSH_BATCH: usize = 256;
 const ZERO_PAGE: [u8; PAGE_SIZE] = [0u8; PAGE_SIZE];
 const MAX_RECORD_LEN: u64 = ((RECORD_HEADER_SIZE + PAGE_SIZE + 7) & !7) as u64;
+const COMPACT_BATCH_BYTES: usize = 1024 * 1024;
 
-type DirtyPage = (u64, Box<[u8; PAGE_SIZE]>, u64);
+type DirtyPage = (u64, Box<AlignedPage>, u64);
 type PageWrite<'a> = (u64, &'a [u8], u64);
+
+/// A page whose payload has been compressed (or copied) but whose record header
+/// has not been built yet. Payload encoding is independent of the log epoch, so
+/// it can run outside the writer lock and in parallel across cores.
+struct EncodedPage {
+    page_no: u64,
+    generation: u64,
+    payload: Vec<u8>,
+    payload_crc: u32,
+    compressed: bool,
+}
 
 /// Configuration for a tiered store.
 #[derive(Clone, Debug)]
@@ -205,6 +218,7 @@ pub struct Store {
     index: RwLock<HashMap<u64, Extent>>,
     cache: PageCache,
     writer: Mutex<WriterState>,
+    flush_lock: Mutex<()>,
     next_generation: AtomicU64,
     metrics: Metrics,
 }
@@ -306,6 +320,7 @@ impl Store {
             index: RwLock::new(index),
             cache: PageCache::new(cache_pages),
             writer: Mutex::new(writer),
+            flush_lock: Mutex::new(()),
             next_generation: AtomicU64::new(next_generation),
             metrics: Metrics::default(),
         };
@@ -544,10 +559,19 @@ impl Store {
                 Metrics::inc(&self.metrics.cache_hits);
             } else {
                 Metrics::inc(&self.metrics.cache_misses);
-                let (page, generation) = self.load_page_data(page_no)?;
-                target.copy_from_slice(&page[page_offset..page_offset + count]);
-                if self.cache_insert_clean(page_no, page, generation).is_err() {
-                    Metrics::inc(&self.metrics.cache_insert_failures);
+                // A cold load can race with a write, a flush, and an eviction.
+                // Publish the loaded page only if the index still names that
+                // generation, and copy the requested range under the shard lock
+                // so the caller never observes a stale version.
+                loop {
+                    if self.cache.read_into(page_no, page_offset, target) {
+                        break;
+                    }
+                    let (page, generation) = self.load_page_data(page_no)?;
+                    match self.publish_clean_page(page_no, generation, page, page_offset, target)? {
+                        CleanPublish::Written => break,
+                        CleanPublish::Cached | CleanPublish::Retry => continue,
+                    }
                 }
                 Metrics::inc(&self.metrics.page_loads);
             }
@@ -571,12 +595,11 @@ impl Store {
             let page_no = absolute / PAGE_SIZE as u64;
             let page_offset = (absolute as usize) % PAGE_SIZE;
             let count = (PAGE_SIZE - page_offset).min(len - done);
-            let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
             if page_offset == 0 && count == PAGE_SIZE {
-                self.cache_write_full(page_no, &buf[done..done + count], generation)?;
+                self.cache_write_full(page_no, &buf[done..done + count])?;
             } else {
                 let source = &buf[done..done + count];
-                self.modify_page(page_no, page_offset, count, generation, |page| {
+                self.modify_page(page_no, page_offset, count, |page| {
                     page.copy_from_slice(source);
                 })?;
             }
@@ -599,11 +622,10 @@ impl Store {
             let page_no = position / PAGE_SIZE as u64;
             let page_offset = (position as usize) % PAGE_SIZE;
             let count = (PAGE_SIZE - page_offset).min((end - position) as usize);
-            let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
             if page_offset == 0 && count == PAGE_SIZE {
-                self.cache_write_full(page_no, &ZERO_PAGE, generation)?;
+                self.cache_write_full(page_no, &ZERO_PAGE)?;
             } else {
-                self.modify_page(page_no, page_offset, count, generation, |page| {
+                self.modify_page(page_no, page_offset, count, |page| {
                     page.fill(0);
                 })?;
             }
@@ -613,7 +635,7 @@ impl Store {
         Ok(())
     }
 
-    fn load_page_data(&self, page_no: u64) -> Result<(Box<[u8; PAGE_SIZE]>, u64)> {
+    fn load_page_data(&self, page_no: u64) -> Result<(Box<AlignedPage>, u64)> {
         // Take the file lock before the index lock. Compaction takes them in
         // the same order, so an extent read here cannot refer to a file that
         // has already been renamed away.
@@ -624,7 +646,7 @@ impl Store {
             index.get(&page_no).copied()
         };
         let Some(extent) = extent else {
-            return Ok((Box::new([0u8; PAGE_SIZE]), 0));
+            return Ok((AlignedPage::zeroed(), 0));
         };
         if extent.offset < DATA_OFFSET
             || extent.offset + extent.record_len() > DATA_OFFSET + self.log_bytes
@@ -633,7 +655,14 @@ impl Store {
                 "index extent for page {page_no} is outside the log"
             )));
         }
-        let (header, payload) = read_record(file, extent.offset)?;
+        let mut header_buffer = [0u8; RECORD_HEADER_SIZE];
+        read_exact_at(file, &mut header_buffer, extent.offset).map_err(|error| {
+            Error::corrupt(format!(
+                "reading record header at {}: {error}",
+                extent.offset
+            ))
+        })?;
+        let header = RecordHeader::decode(&header_buffer)?;
         if header.page_no != page_no
             || header.generation != extent.generation
             || header.epoch != extent.epoch
@@ -644,9 +673,19 @@ impl Store {
                 "record for page {page_no} does not match the index"
             )));
         }
-        let mut data = Box::new([0u8; PAGE_SIZE]);
+        let stored = header.stored_len as usize;
+        let payload_offset = extent.offset + RECORD_HEADER_SIZE as u64;
+        let mut data = AlignedPage::zeroed();
         if header.is_compressed() {
-            let written = lz4_flex::block::decompress_into(&payload, &mut data[..])
+            let mut payload = [0u8; MAX_STORED_LEN];
+            read_exact_at(file, &mut payload[..stored], payload_offset)?;
+            if crc32c::crc32c(&payload[..stored]) != header.payload_crc {
+                return Err(Error::corrupt(format!(
+                    "payload checksum mismatch at {}",
+                    extent.offset
+                )));
+            }
+            let written = lz4_flex::block::decompress_into(&payload[..stored], &mut data.0[..])
                 .map_err(|error| Error::Compression(format!("{error:?}")))?;
             if written != PAGE_SIZE {
                 return Err(Error::corrupt(format!(
@@ -654,101 +693,231 @@ impl Store {
                 )));
             }
         } else {
-            if payload.len() != PAGE_SIZE {
+            if stored != PAGE_SIZE {
                 return Err(Error::corrupt(format!(
-                    "page {page_no} has {} stored bytes",
-                    payload.len()
+                    "page {page_no} has {stored} stored bytes"
                 )));
             }
-            data.copy_from_slice(&payload);
+            // Read the payload straight into the aligned cache page. This is
+            // the zero-bounce-buffer path: one kernel copy, no intermediate
+            // userspace allocation.
+            read_exact_at(file, &mut data.0, payload_offset)?;
+            if crc32c::crc32c(&data.0) != header.payload_crc {
+                return Err(Error::corrupt(format!(
+                    "payload checksum mismatch at {}",
+                    extent.offset
+                )));
+            }
         }
         Ok((data, extent.generation))
     }
 
-    fn cache_write_full(&self, page_no: u64, data: &[u8], generation: u64) -> Result<()> {
+    fn cache_write_full(&self, page_no: u64, data: &[u8]) -> Result<()> {
         if data.len() != PAGE_SIZE {
             return Err(Error::Config(
                 "page writes must be exactly 4096 bytes".into(),
             ));
         }
-        let mut shard = self.cache.shard_for(page_no).lock();
-        if let Some(page) = shard.pages.get_mut(&page_no) {
-            page.data.copy_from_slice(data);
-            page.dirty = true;
-            page.referenced = true;
-            page.generation = generation;
-            return Ok(());
+        loop {
+            {
+                let mut shard = self.cache.shard_for(page_no).lock.write();
+                if let Some(page) = shard.pages.get_mut(&page_no) {
+                    let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
+                    page.data.0.copy_from_slice(data);
+                    page.dirty = true;
+                    page.referenced.store(true, Ordering::Relaxed);
+                    page.generation = generation;
+                    return Ok(());
+                }
+                if shard.pages.len() < shard.capacity {
+                    let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
+                    let mut buffer = shard.acquire();
+                    buffer.0.copy_from_slice(data);
+                    shard.insert(page_no, CachePage::new(buffer, generation, true));
+                    return Ok(());
+                }
+            }
+            // The shard is full. Make room without holding its lock; eviction
+            // may need to append a dirty page to the cold log.
+            self.make_space(page_no)?;
         }
-        self.ensure_space_locked(&mut shard)?;
-        let mut page = Box::new([0u8; PAGE_SIZE]);
-        page.copy_from_slice(data);
-        shard.insert(page_no, CachePage::new(page, generation, true));
-        Ok(())
     }
 
-    /// Read-modify-write a sub-page range while holding the cache shard lock.
+    /// Read-modify-write a sub-page range.
     ///
-    /// The shard lock keeps a full-page write from replacing the page between
-    /// the load and the insertion, which would silently lose an update.
-    fn modify_page<F>(
-        &self,
-        page_no: u64,
-        page_offset: usize,
-        len: usize,
-        generation: u64,
-        modify: F,
-    ) -> Result<()>
+    /// A cold load happens before the shard lock is taken so a partial write
+    /// never stalls hot readers. If another thread inserts the page while the
+    /// load is in flight, the modification is replayed against the cached page
+    /// under the lock. If a flush publishes a newer version of the page while
+    /// the load is in flight, the load is retried, so a partial write can never
+    /// resurrect an older page body.
+    fn modify_page<F>(&self, page_no: u64, page_offset: usize, len: usize, modify: F) -> Result<()>
     where
-        F: FnOnce(&mut [u8]),
+        F: Fn(&mut [u8]),
     {
         if len == 0 || page_offset + len > PAGE_SIZE {
             return Err(Error::Config("invalid page range".into()));
         }
         let end = page_offset + len;
-        let mut shard = self.cache.shard_for(page_no).lock();
-        if let Some(page) = shard.pages.get_mut(&page_no) {
-            modify(&mut page.data[page_offset..end]);
-            page.dirty = true;
-            page.referenced = true;
-            page.generation = generation;
-            return Ok(());
-        }
-        let (mut page, _) = self.load_page_data(page_no)?;
-        modify(&mut page[page_offset..end]);
-        self.ensure_space_locked(&mut shard)?;
-        shard.insert(page_no, CachePage::new(page, generation, true));
-        Ok(())
-    }
-
-    fn cache_insert_clean(
-        &self,
-        page_no: u64,
-        data: Box<[u8; PAGE_SIZE]>,
-        generation: u64,
-    ) -> Result<()> {
-        let mut shard = self.cache.shard_for(page_no).lock();
-        if shard.pages.contains_key(&page_no) {
-            return Ok(());
-        }
-        self.ensure_space_locked(&mut shard)?;
-        shard.insert(page_no, CachePage::new(data, generation, false));
-        Ok(())
-    }
-
-    fn ensure_space_locked(&self, shard: &mut Shard) -> Result<()> {
-        while shard.pages.len() >= shard.capacity {
-            let (page_no, victim) = shard.evict_candidate().ok_or(Error::CacheFull)?;
-            if victim.dirty {
-                if let Err(error) = self.spill_page(page_no, &victim.data[..], victim.generation) {
-                    shard.insert(page_no, victim);
-                    return Err(error);
+        loop {
+            // Fast path: the page is already cached.
+            {
+                let mut shard = self.cache.shard_for(page_no).lock.write();
+                if let Some(page) = shard.pages.get_mut(&page_no) {
+                    let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
+                    modify(&mut page.data.0[page_offset..end]);
+                    page.dirty = true;
+                    page.referenced.store(true, Ordering::Relaxed);
+                    page.generation = generation;
+                    return Ok(());
                 }
-                Metrics::inc(&self.metrics.evictions_dirty);
-            } else {
-                Metrics::inc(&self.metrics.evictions_clean);
+                if shard.pages.len() >= shard.capacity {
+                    drop(shard);
+                    self.make_space(page_no)?;
+                    continue;
+                }
+            }
+
+            // Cold path. Keep the loaded page across make_space retries so a
+            // full shard does not force a second cold read.
+            let (mut page, mut generation) = self.load_page_data(page_no)?;
+            modify(&mut page.0[page_offset..end]);
+            loop {
+                // Validate freshness under the index read lock, then apply the
+                // modification to whichever page is newest.
+                let index = self.index.read();
+                let current = index.get(&page_no).map_or(0, |extent| extent.generation);
+                if current != generation {
+                    drop(index);
+                    (page, generation) = self.load_page_data(page_no)?;
+                    modify(&mut page.0[page_offset..end]);
+                    continue;
+                }
+                let mut shard = self.cache.shard_for(page_no).lock.write();
+                if shard.pages.contains_key(&page_no) {
+                    let new_generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
+                    let cached = shard.pages.get_mut(&page_no).expect("page is present");
+                    modify(&mut cached.data.0[page_offset..end]);
+                    cached.dirty = true;
+                    cached.referenced.store(true, Ordering::Relaxed);
+                    cached.generation = new_generation;
+                    shard.recycle(page);
+                    return Ok(());
+                }
+                if shard.pages.len() >= shard.capacity {
+                    drop(shard);
+                    drop(index);
+                    self.make_space(page_no)?;
+                    continue;
+                }
+                let new_generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
+                shard.insert(page_no, CachePage::new(page, new_generation, true));
+                return Ok(());
             }
         }
-        Ok(())
+    }
+
+    fn publish_clean_page(
+        &self,
+        page_no: u64,
+        generation: u64,
+        page: Box<AlignedPage>,
+        page_offset: usize,
+        target: &mut [u8],
+    ) -> Result<CleanPublish> {
+        debug_assert!(page_offset + target.len() <= PAGE_SIZE);
+        loop {
+            // Hold the index read while inserting. Without this check a clean
+            // page loaded before a flush could be inserted after that flush's
+            // newer record became visible, leaving a stale clean page in the
+            // cache.
+            //
+            // This is the only path that takes an index lock before a shard
+            // lock. It never takes the writer or file locks, and no path holds
+            // a shard lock while waiting for the index, so the order is safe.
+            let index = self.index.read();
+            let current = index.get(&page_no).map_or(0, |extent| extent.generation);
+            if current != generation {
+                return Ok(CleanPublish::Retry);
+            }
+            let mut shard = self.cache.shard_for(page_no).lock.write();
+            if shard.pages.contains_key(&page_no) {
+                shard.recycle(page);
+                return Ok(CleanPublish::Cached);
+            }
+            if shard.pages.len() >= shard.capacity {
+                drop(shard);
+                drop(index);
+                // make_space appends dirty victims and needs the writer, file,
+                // and index locks. Those must not be taken while the index read
+                // guard is held. The loaded page stays alive across the retry so
+                // a full cache does not force a second cold read.
+                if let Err(error) = self.make_space(page_no) {
+                    Metrics::inc(&self.metrics.cache_insert_failures);
+                    return Err(error);
+                }
+                continue;
+            }
+            target.copy_from_slice(&page.0[page_offset..page_offset + target.len()]);
+            shard.insert(page_no, CachePage::new(page, generation, false));
+            return Ok(CleanPublish::Written);
+        }
+    }
+
+    /// Ensure the shard that owns `page_no` has a free slot.
+    ///
+    /// Clean pages are evicted directly. Dirty pages are snapshotted, appended
+    /// while the shard lock is released, and then removed once the new record
+    /// is in the index. Keeping the dirty page visible until the append commits
+    /// prevents a reader from observing the older cold copy.
+    fn make_space(&self, page_no: u64) -> Result<()> {
+        let mut rounds = 0usize;
+        loop {
+            let snapshot = {
+                let mut shard = self.cache.shard_for(page_no).lock.write();
+                if shard.pages.len() < shard.capacity {
+                    return Ok(());
+                }
+                if let Some(victim) = shard.evict_clean() {
+                    shard.recycle(victim.data);
+                    Metrics::inc(&self.metrics.evictions_clean);
+                    return Ok(());
+                }
+                shard.dirty_snapshot()
+            };
+
+            let Some((victim_no, data, generation)) = snapshot else {
+                return Err(Error::CacheFull);
+            };
+            self.spill_page(victim_no, &data.0, generation)?;
+            Metrics::inc(&self.metrics.evictions_dirty);
+
+            let removed = {
+                let mut shard = self.cache.shard_for(victim_no).lock.write();
+                let unchanged = shard
+                    .pages
+                    .get(&victim_no)
+                    .is_some_and(|page| page.generation == generation);
+                if unchanged {
+                    shard.remove(victim_no)
+                } else {
+                    shard.mark_clean(victim_no, generation);
+                    None
+                }
+            };
+            let mut shard = self.cache.shard_for(page_no).lock.write();
+            shard.recycle(data);
+            if let Some(page) = removed {
+                shard.recycle(page.data);
+                return Ok(());
+            }
+            drop(shard);
+
+            rounds += 1;
+            if rounds > 256 {
+                return Err(Error::CacheFull);
+            }
+        }
     }
 
     fn spill_page(&self, page_no: u64, data: &[u8], generation: u64) -> Result<()> {
@@ -759,6 +928,19 @@ impl Store {
         Metrics::inc(&self.metrics.page_stores);
         Ok(())
     }
+}
+
+/// Outcome of publishing a page loaded from the cold tier.
+enum CleanPublish {
+    /// The page was inserted and the requested range was copied into the
+    /// caller's buffer.
+    Written,
+    /// Another thread already has a version of the page in the cache. The
+    /// caller should read the cached page instead.
+    Cached,
+    /// The index moved on or the shard was full. The caller should retry; a
+    /// retry either hits the cache or reloads the newest cold record.
+    Retry,
 }
 
 fn read_record(file: &File, offset: u64) -> Result<(RecordHeader, Vec<u8>)> {
@@ -784,23 +966,23 @@ impl Store {
     /// while a flush is in progress are not chased indefinitely. They remain
     /// dirty and will be covered by the next flush.
     pub fn flush(&self) -> Result<()> {
+        // Serialize flushers so two callers cannot append the same dirty batch
+        // twice. The hot data path never takes this lock.
+        let _flush = self.flush_lock.lock();
         let mark = self.next_generation.load(Ordering::SeqCst);
         let mut did_work = false;
 
         loop {
             let mut batch: Vec<DirtyPage> = Vec::new();
-            for shard in self.cache.shards() {
-                let guard = shard.lock();
+            'shards: for shard in self.cache.shards() {
+                let guard = shard.lock.read();
                 for (page_no, page) in &guard.pages {
                     if page.dirty && page.generation < mark {
                         batch.push((*page_no, page.data.clone(), page.generation));
                         if batch.len() >= MAX_FLUSH_BATCH {
-                            break;
+                            break 'shards;
                         }
                     }
-                }
-                if batch.len() >= MAX_FLUSH_BATCH {
-                    break;
                 }
             }
             if batch.is_empty() {
@@ -809,7 +991,7 @@ impl Store {
 
             let references: Vec<PageWrite<'_>> = batch
                 .iter()
-                .map(|(page_no, data, generation)| (*page_no, &data[..], *generation))
+                .map(|(page_no, data, generation)| (*page_no, &data.0[..], *generation))
                 .collect();
             let extents = self.append_pages(&references)?;
             if extents.len() != batch.len() {
@@ -817,12 +999,8 @@ impl Store {
             }
 
             for (page_no, _, generation) in &batch {
-                let mut shard = self.cache.shard_for(*page_no).lock();
-                if let Some(page) = shard.pages.get_mut(page_no) {
-                    if page.generation == *generation {
-                        page.dirty = false;
-                    }
-                }
+                let mut shard = self.cache.shard_for(*page_no).lock.write();
+                shard.mark_clean(*page_no, *generation);
             }
 
             Metrics::add(&self.metrics.page_stores, batch.len() as u64);
@@ -917,27 +1095,62 @@ impl Store {
         if pages.is_empty() {
             return Ok(Vec::new());
         }
-        let worst = (pages.len() as u64)
-            .checked_mul(MAX_RECORD_LEN)
-            .ok_or_else(|| Error::Config("batch is too large".into()))?;
+        // Compress and checksum outside the writer lock. Large flushes use the
+        // work-stealing pool so payload encoding scales across all cores; the
+        // actual log append remains a single ordered batch.
+        let encoded: Vec<EncodedPage> = if pages.len() >= 8 {
+            pages
+                .par_iter()
+                .map(|(page_no, data, generation)| {
+                    encode_page(*page_no, *data, *generation, self.compress)
+                })
+                .collect::<Vec<Result<EncodedPage>>>()
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            pages
+                .iter()
+                .map(|(page_no, data, generation)| {
+                    encode_page(*page_no, *data, *generation, self.compress)
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        self.append_encoded(&encoded)
+    }
+
+    fn append_encoded(&self, pages: &[EncodedPage]) -> Result<Vec<Extent>> {
+        if pages.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut needed: u64 = 0;
+        for page in pages {
+            needed = needed
+                .checked_add(align_up(
+                    RECORD_HEADER_SIZE as u64 + page.payload.len() as u64,
+                    8,
+                ))
+                .ok_or_else(|| Error::Config("batch is too large".into()))?;
+        }
+        let capacity = usize::try_from(needed)
+            .map_err(|_| Error::Config("batch is too large for this platform".into()))?;
 
         let mut writer = self.writer.lock();
         loop {
-            let end = writer.head.checked_add(worst).ok_or(Error::LogFull {
-                needed: worst,
+            let end = writer.head.checked_add(needed).ok_or(Error::LogFull {
+                needed,
                 available: 0,
             })?;
             if end <= DATA_OFFSET + writer.log_bytes {
                 break;
             }
             self.compact_locked(&mut writer)?;
-            let end = writer.head.checked_add(worst).ok_or(Error::LogFull {
-                needed: worst,
+            let end = writer.head.checked_add(needed).ok_or(Error::LogFull {
+                needed,
                 available: 0,
             })?;
             if end > DATA_OFFSET + writer.log_bytes {
                 return Err(Error::LogFull {
-                    needed: worst,
+                    needed,
                     available: (DATA_OFFSET + writer.log_bytes).saturating_sub(writer.head),
                 });
             }
@@ -945,46 +1158,44 @@ impl Store {
 
         let guard = self.file.read();
         let file = guard.as_ref().ok_or(Error::Closed)?;
+        let mut batch = Vec::with_capacity(capacity);
         let mut extents = Vec::with_capacity(pages.len());
-        for (page_no, data, generation) in pages {
-            if data.len() != PAGE_SIZE {
-                return Err(Error::Config(
-                    "page writes must be exactly 4096 bytes".into(),
-                ));
-            }
-            let (record, header) =
-                encode_record(*page_no, data, *generation, writer.epoch, self.compress)?;
-            let end = writer
-                .head
-                .checked_add(record.len() as u64)
-                .ok_or(Error::LogFull {
-                    needed: record.len() as u64,
-                    available: 0,
-                })?;
-            if end > DATA_OFFSET + writer.log_bytes {
-                return Err(Error::LogFull {
-                    needed: record.len() as u64,
-                    available: (DATA_OFFSET + writer.log_bytes).saturating_sub(writer.head),
-                });
-            }
-            write_all_at(file, &record, writer.head)?;
-            let extent = Extent {
-                offset: writer.head,
+        for page in pages {
+            let offset = writer.head + batch.len() as u64;
+            let header = RecordHeader {
+                flags: if page.compressed {
+                    RECORD_FLAG_COMPRESSED
+                } else {
+                    0
+                },
+                page_no: page.page_no,
+                generation: page.generation,
+                epoch: writer.epoch,
+                raw_len: PAGE_SIZE as u32,
+                stored_len: page.payload.len() as u32,
+                payload_crc: page.payload_crc,
+            };
+            let record_len = header.record_len() as usize;
+            let start = batch.len();
+            batch.resize(start + record_len, 0);
+            batch[start..start + RECORD_HEADER_SIZE].copy_from_slice(&header.encode());
+            let payload_start = start + RECORD_HEADER_SIZE;
+            batch[payload_start..payload_start + page.payload.len()]
+                .copy_from_slice(&page.payload);
+            extents.push(Extent {
+                offset,
                 stored_len: header.stored_len,
                 generation: header.generation,
                 epoch: header.epoch,
                 compressed: header.is_compressed(),
-            };
-            writer.head = end;
-            extents.push(extent);
-            if header.is_compressed() {
-                Metrics::inc(&self.metrics.compressed_pages);
-            } else {
-                Metrics::inc(&self.metrics.uncompressed_pages);
-            }
-            Metrics::add(&self.metrics.stored_bytes, header.stored_len as u64);
-            Metrics::add(&self.metrics.raw_bytes, PAGE_SIZE as u64);
+            });
         }
+
+        // One positioned write for the entire batch. This is the access
+        // pattern flash controllers handle best and removes one syscall per
+        // page from the flush path.
+        write_all_at(file, &batch, writer.head)?;
+        writer.head += batch.len() as u64;
         file.sync_data()?;
         if let Err(error) = self.checkpoint_locked(&mut writer, file) {
             writer.needs_checkpoint = true;
@@ -997,14 +1208,23 @@ impl Store {
         // visibility update.
         {
             let mut index = self.index.write();
-            for ((page_no, _, _), extent) in pages.iter().zip(extents.iter()) {
-                match index.get(page_no) {
+            for (page, extent) in pages.iter().zip(extents.iter()) {
+                match index.get(&page.page_no) {
                     Some(existing) if existing.generation > extent.generation => {}
                     _ => {
-                        index.insert(*page_no, *extent);
+                        index.insert(page.page_no, *extent);
                     }
                 }
             }
+        }
+        for page in pages {
+            if page.compressed {
+                Metrics::inc(&self.metrics.compressed_pages);
+            } else {
+                Metrics::inc(&self.metrics.uncompressed_pages);
+            }
+            Metrics::add(&self.metrics.stored_bytes, page.payload.len() as u64);
+            Metrics::add(&self.metrics.raw_bytes, PAGE_SIZE as u64);
         }
         Ok(extents)
     }
@@ -1061,6 +1281,8 @@ impl Store {
             .ok_or_else(|| Error::corrupt("checkpoint generation overflow"))?;
         let mut new_head = DATA_OFFSET;
         let mut new_index = HashMap::with_capacity(live.len());
+        let mut batch: Vec<u8> = Vec::with_capacity(COMPACT_BATCH_BYTES + MAX_RECORD_LEN as usize);
+        let mut payload = Vec::new();
 
         for (page_no, extent) in live {
             if extent.offset < DATA_OFFSET
@@ -1082,7 +1304,7 @@ impl Store {
                     "record for page {page_no} does not match the index"
                 )));
             }
-            let mut payload = vec![0u8; header.stored_len as usize];
+            payload.resize(header.stored_len as usize, 0);
             read_exact_at(
                 &old_file,
                 &mut payload,
@@ -1097,31 +1319,50 @@ impl Store {
                 epoch: new_epoch,
                 ..header
             };
-            let record = encode_record_with_payload(&new_header, &payload)?;
-            let end = new_head
-                .checked_add(record.len() as u64)
+            let record_len = new_header.record_len();
+            let record_offset = new_head
+                .checked_add(batch.len() as u64)
                 .ok_or(Error::LogFull {
-                    needed: record.len() as u64,
+                    needed: record_len,
+                    available: 0,
+                })?;
+            let end = record_offset
+                .checked_add(record_len)
+                .ok_or(Error::LogFull {
+                    needed: record_len,
                     available: 0,
                 })?;
             if end > DATA_OFFSET + writer.log_bytes {
                 return Err(Error::LogFull {
-                    needed: record.len() as u64,
-                    available: (DATA_OFFSET + writer.log_bytes).saturating_sub(new_head),
+                    needed: record_len,
+                    available: (DATA_OFFSET + writer.log_bytes).saturating_sub(record_offset),
                 });
             }
-            write_all_at(&compact, &record, new_head)?;
+            let start = batch.len();
+            batch.resize(start + record_len as usize, 0);
+            batch[start..start + RECORD_HEADER_SIZE].copy_from_slice(&new_header.encode());
+            let payload_start = start + RECORD_HEADER_SIZE;
+            batch[payload_start..payload_start + payload.len()].copy_from_slice(&payload);
             new_index.insert(
                 page_no,
                 Extent {
-                    offset: new_head,
+                    offset: record_offset,
                     stored_len: new_header.stored_len,
                     generation: new_header.generation,
                     epoch: new_header.epoch,
                     compressed: new_header.is_compressed(),
                 },
             );
-            new_head = end;
+            if batch.len() >= COMPACT_BATCH_BYTES {
+                write_all_at(&compact, &batch, new_head)?;
+                new_head += batch.len() as u64;
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            write_all_at(&compact, &batch, new_head)?;
+            new_head += batch.len() as u64;
+            batch.clear();
         }
 
         compact.sync_all()?;
@@ -1184,60 +1425,52 @@ impl Store {
     }
 }
 
-fn encode_record(
+/// Compress (or copy) one page payload and checksum it. The result is
+/// independent of the log epoch, which lets callers encode a whole batch in
+/// parallel before taking the writer lock.
+fn encode_page(
     page_no: u64,
     data: &[u8],
     generation: u64,
-    epoch: u64,
     compress: bool,
-) -> Result<(Vec<u8>, RecordHeader)> {
+) -> Result<EncodedPage> {
     if data.len() != PAGE_SIZE {
         return Err(Error::Config(
             "page writes must be exactly 4096 bytes".into(),
         ));
     }
-    let (payload, flags) = if compress {
+    if compress {
         let maximum = lz4_flex::block::get_maximum_output_size(PAGE_SIZE);
-        let mut buffer = vec![0u8; maximum];
-        match lz4_flex::block::compress_into(data, &mut buffer) {
+        let mut payload = vec![0u8; maximum];
+        match lz4_flex::block::compress_into(data, &mut payload) {
             Ok(length) if length < data.len() => {
-                buffer.truncate(length);
-                (buffer, RECORD_FLAG_COMPRESSED)
+                payload.truncate(length);
+                Ok(EncodedPage {
+                    page_no,
+                    generation,
+                    payload_crc: crc32c::crc32c(&payload),
+                    payload,
+                    compressed: true,
+                })
             }
-            Ok(_) => (data.to_vec(), 0),
-            Err(error) => return Err(Error::Compression(format!("{error:?}"))),
+            Ok(_) => Ok(EncodedPage {
+                page_no,
+                generation,
+                payload_crc: crc32c::crc32c(data),
+                payload: data.to_vec(),
+                compressed: false,
+            }),
+            Err(error) => Err(Error::Compression(format!("{error:?}"))),
         }
     } else {
-        (data.to_vec(), 0)
-    };
-    let header = RecordHeader {
-        flags,
-        page_no,
-        generation,
-        epoch,
-        raw_len: PAGE_SIZE as u32,
-        stored_len: payload.len() as u32,
-        payload_crc: crc32c::crc32c(&payload),
-    };
-    let record = encode_record_with_payload(&header, &payload)?;
-    Ok((record, header))
-}
-
-fn encode_record_with_payload(header: &RecordHeader, payload: &[u8]) -> Result<Vec<u8>> {
-    if payload.len() != header.stored_len as usize {
-        return Err(Error::corrupt(
-            "record payload length does not match header",
-        ));
+        Ok(EncodedPage {
+            page_no,
+            generation,
+            payload_crc: crc32c::crc32c(data),
+            payload: data.to_vec(),
+            compressed: false,
+        })
     }
-    let length = header.record_len() as usize;
-    if length < RECORD_HEADER_SIZE + payload.len() {
-        return Err(Error::corrupt("record length is too small"));
-    }
-    let mut record = Vec::with_capacity(length);
-    record.extend_from_slice(&header.encode());
-    record.extend_from_slice(payload);
-    record.resize(length, 0);
-    Ok(record)
 }
 
 impl std::fmt::Debug for Store {

@@ -25,7 +25,12 @@ working, testable, cross-platform storage engine rather than a kernel stub.
 ## Highlights
 
 - **4 KiB paged block device** with a simple, documented on-disk format.
-- **Sharded CLOCK page cache** with per-shard locks for concurrent hot I/O.
+- **Sharded CLOCK page cache** with cache-line-padded read/write locks,
+  4 KiB-aligned page buffers, and per-shard buffer recycling.
+- **Thread-per-core NBD pipeline**: each connection has a reader that feeds a
+  bounded MPMC queue; a shared worker pool executes READ, WRITE, and TRIM in
+  parallel, with replies serialized per connection. FLUSH and FUA act as ordered
+  barriers so durability semantics match the NBD specification.
 - **LZ4-compressed cold pages** with automatic fallback to raw pages when
   compression would expand data.
 - **CRC32C on every record and every superblock** for corruption detection.
@@ -145,20 +150,28 @@ concurrency rules.
 
 ## Performance expectations
 
-- **Hot reads/writes** hit the sharded RAM cache and are bounded by memory
-  bandwidth and lock contention, not by USB.
+- **Hot reads** take a shared shard lock, copy from a 4 KiB-aligned page, and
+  return without touching the log. Readers never serialize against other
+  readers on the same shard.
+- **Hot writes** take an exclusive shard lock, assign a generation under that
+  lock, and return. Full-page writes never touch the cold tier.
 - **Cold reads** pay for a positioned file read, CRC32C verification, and LZ4
-  decompression. The USB device is the bottleneck.
-- **Flushes** are sequential appends with one fsync per batch; this is the best
-  access pattern for flash.
+  decompression. Uncompressed records are read directly into the aligned cache
+  page, with no intermediate userspace buffer. The USB device is the bottleneck.
+- **Flushes** compress and checksum pages in parallel, then issue one positioned
+  write for the whole batch, fsync the data, and fsync the commit superblock.
+  This is the best access pattern for flash.
 - **Compression** reduces bytes written to USB for compressible data. Text,
   zero-filled pages, and sparse files benefit the most; already-compressed data
   is stored raw when LZ4 would expand it.
 - **Compaction** costs one rewrite of the live set. Size the log to avoid
   frequent compactions, or call `compact` during maintenance windows.
+- **Latency**: `bench` reports hot-read p50/p99 latency alongside throughput.
 
 `usbasram` is not a replacement for physical RAM. It is a durable, portable,
 crash-safe tier that keeps the hot set in RAM and pushes the cold set to USB.
+The data path is a userspace thread-per-core engine with batched positioned
+I/O; it does not require kernel-bypass or a special block driver.
 
 ## Durability model
 
@@ -208,6 +221,15 @@ crates/usbasram-cli    command-line interface and benchmark
 - `TRIM` and `WRITE_ZEROES` zero pages. They do not issue ATA/SCSI discard
   commands to the USB device.
 - Compaction temporarily needs space for a second copy of the live set.
+- The data path uses portable positioned reads and writes. It does not yet issue
+  `io_uring` on Linux or IOCP on Windows, and the cache is not hugepage-backed.
+
+## Roadmap
+
+- Batch block I/O through `io_uring` on Linux and IOCP on Windows behind the
+  current `Store` interface.
+- Optional hugepage-backed cache allocation and direct-I/O alignment.
+- Queue-depth and worker-count tuning guidance for NBD clients.
 
 ## License
 

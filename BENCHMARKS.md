@@ -20,16 +20,21 @@ cargo run --release -p usbasram-cli -- bench --quick --json
 ```
 
 The JSON output includes `ops`, `bytes`, elapsed seconds, IOPS, and GiB/s for
-each phase. CI uploads the latest result as the `benchmark-json` artifact on the
-`CI` workflow run.
+each phase, plus `hot_read_p50_ns` and `hot_read_p99_ns` for a separate 20,000
+sample single-thread latency pass. CI uploads the latest result as the
+`benchmark-json` artifact on the `CI` workflow run.
 
 ## Phases
 
 | Phase | Cache | What it measures |
 | --- | --- | --- |
-| `hot_read` | Entire logical size | RAM cache hit path, shard lock contention, and copy bandwidth |
-| `hot_write` | Entire logical size | RAM cache write path and generation allocation |
+| `hot_read` | Entire logical size | Shared-lock cache hits across all shards, 4 KiB-aligned copies, and memory bandwidth |
+| `hot_write` | Entire logical size | Exclusive-lock cache writes and generation allocation |
 | `cold_read` | 4 MiB | Positioned file reads, CRC32C verification, LZ4 decompression, and cache fills |
+
+The 64 MiB benchmark uses 128 cache shards on a 64 MiB cache, each protected by
+a 128-byte-aligned `RwLock`. Increase `--threads` to measure how far the shared
+read path scales; the default is 4.
 
 ## Reference CI run
 

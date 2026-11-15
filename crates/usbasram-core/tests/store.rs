@@ -169,6 +169,43 @@ fn minimum_log_survives_repeated_full_capacity_flushes() {
 }
 
 #[test]
+fn concurrent_disjoint_writes_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.usr");
+    let pages = 128u64;
+    let threads = 4u64;
+    let per_thread = pages / threads;
+
+    {
+        let store = Store::open(config(&path, pages, 16)).unwrap();
+        std::thread::scope(|scope| {
+            for thread_id in 0..threads {
+                let store = &store;
+                scope.spawn(move || {
+                    let start = thread_id * per_thread;
+                    for page in start..start + per_thread {
+                        let mut block = pattern(page, PAGE_SIZE);
+                        block[0] = thread_id as u8;
+                        store.write_at(page * PAGE_SIZE as u64, &block).unwrap();
+                    }
+                });
+            }
+        });
+        store.flush().unwrap();
+    }
+
+    let store = Store::open(config(&path, pages, 8)).unwrap();
+    let mut out = vec![0u8; PAGE_SIZE];
+    for page in 0..pages {
+        store.read_at(page * PAGE_SIZE as u64, &mut out).unwrap();
+        let mut expected = pattern(page, PAGE_SIZE);
+        expected[0] = (page / per_thread) as u8;
+        assert_eq!(out, expected, "page {page} was corrupted");
+    }
+    store.verify().unwrap();
+}
+
+#[test]
 fn rejects_wrong_capacity() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("store.usr");

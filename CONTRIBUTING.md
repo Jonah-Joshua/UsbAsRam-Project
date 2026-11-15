@@ -27,8 +27,11 @@ your change passes locally before opening a pull request.
 ## Code guidelines
 
 - Keep `usbasram-core` free of `unsafe` code. It uses `#![forbid(unsafe_code)]`.
-- Preserve the lock order documented in `ARCHITECTURE.md`:
-  `cache shard -> writer -> file -> index`.
+- Preserve the lock ordering documented in `ARCHITECTURE.md`. Log operations
+  take `writer -> file -> index`. The cold-fill path takes
+  `index (read) -> cache shard (write)` and never takes `writer` or `file`.
+  No path may hold a cache shard lock while acquiring `writer`, `file`, or
+  `index` (apart from the cold-fill direction above).
 - Add a regression test for every bug fix that affects data integrity.
 - Prefer explicit error handling over panics in library code. Panics are
   acceptable only for programmer errors that cannot be recovered.
