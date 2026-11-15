@@ -129,6 +129,14 @@ impl Io {
     }
 
     pub(crate) fn open(&self, path: &Path, spec: OpenSpec) -> io::Result<File> {
+        // The IOCP backend opens its own handle so the overlapped and
+        // no-buffering flags are explicit rather than dependent on how the
+        // standard library translates `custom_flags`.
+        #[cfg(all(windows, feature = "iocp"))]
+        if self.status.mode == IoMode::Iocp {
+            return iocp::open(path, spec);
+        }
+
         let mut options = OpenOptions::new();
         options
             .read(spec.read)
@@ -172,11 +180,6 @@ impl Io {
             if flags != 0 {
                 options.custom_flags(flags);
             }
-            eprintln!(
-                "DBG open {} flags={flags:#x} status={:?}",
-                path.display(),
-                self.status
-            );
             options.open(path)
         }
 
@@ -795,13 +798,55 @@ mod iocp {
         // file returns the existing port and is harmless.
         let result = unsafe { CreateIoCompletionPort(handle, port, 0, 0) };
         if result.is_null() {
-            let error = io::Error::last_os_error();
-            eprintln!(
-                "DBG associate failed port={port:?} handle={handle:?} error={error:?}"
-            );
-            return Err(error);
+            return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    /// Open a file handle with explicit Windows flags for overlapped direct
+    /// I/O. `std::fs::OpenOptions::custom_flags` is documented to pass these
+    /// through, but opening the handle here keeps the IOCP contract visible
+    /// and independent of standard-library changes.
+    pub(super) fn open(path: &Path, spec: OpenSpec) -> io::Result<File> {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            CREATE_ALWAYS, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_NO_BUFFERING,
+            FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            GENERIC_READ, GENERIC_WRITE, OPEN_ALWAYS, OPEN_EXISTING,
+        };
+
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        wide.push(0);
+        let access = (if spec.read { GENERIC_READ } else { 0 })
+            | (if spec.write { GENERIC_WRITE } else { 0 });
+        let disposition = if spec.truncate {
+            CREATE_ALWAYS
+        } else if spec.create {
+            OPEN_ALWAYS
+        } else {
+            OPEN_EXISTING
+        };
+        let flags =
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED;
+        // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives the call
+        // and every other argument is a plain value.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                ptr::null_mut(),
+                disposition,
+                flags,
+                ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `CreateFileW` returned a fresh handle owned by this function.
+        Ok(unsafe { File::from_raw_handle(handle) })
     }
 
     fn overlapped_io(
