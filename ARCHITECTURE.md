@@ -15,6 +15,10 @@ and the concurrency model of `usbasram`.
    from the store file alone.
 5. **Portability.** The same engine must build and pass tests on Linux, Windows,
    and macOS.
+6. **Optional acceleration, never a requirement.** Portable positioned I/O is the
+   default and always works. Direct I/O, io_uring, IOCP, and hugepages are opt-in
+   features; an unavailable feature falls back cleanly and the effective mode is
+   reported.
 
 The design is a write-back cache over an append-only log. It is deliberately
 not a kernel driver: a userspace process owns the store and exposes it through
@@ -26,13 +30,15 @@ NBD.
 ┌─────────────────────────────────────────────────────────────┐
 │ Hot tier: sharded CLOCK page cache in RAM                   │
 │ - 4 KiB-aligned pages, 128-byte aligned shard locks         │
+│ - optional hugepage-backed pages                            │
 │ - shared read locks, exclusive write locks                  │
 │ - dirty / atomic referenced bits, per-page generation       │
 │ - per-shard free list for page-buffer recycling             │
 └───────────────────────────┬─────────────────────────────────┘
-                            │ eviction or explicit flush
+                            │ adaptive coalesced flush
 ┌───────────────────────────▼─────────────────────────────────┐
 │ Cold tier: append-only log on the backing file              │
+│ - portable / direct / io_uring / IOCP positioned I/O        │
 │ - CRC32C-protected records                                  │
 │ - optional LZ4 payloads                                     │
 │ - A/B superblock checkpoints                                │
@@ -63,6 +69,13 @@ offset 8192     append-only record log
 `log_bytes` is stored in the superblock and is the capacity of the record log,
 not the current file length. The file grows as records are appended. A new
 store is only 8192 bytes long until the first flush.
+
+The on-disk record format is unchanged from v1.1. A direct backend reads and
+writes whole 4096-byte sectors, so an existing file whose tail ends on an
+8-byte record boundary is extended with zeroes to a 4096-byte multiple when it
+is opened in direct mode. The recovery scan stops at the first all-zero record
+header, so the padding is invisible to the format. A compacted store gets the
+same tail padding before it is renamed into place.
 
 ### 3.2 Superblock
 
@@ -164,9 +177,19 @@ against a file that has already been renamed away.
 ## 6. Flush and checkpoints
 
 `Store::flush` captures the current generation high-water mark, then repeatedly
-collects up to 256 dirty pages whose generation is below the mark. Writes that
+collects a dirty-page batch whose generation is below the mark. Writes that
 start after the mark are not chased; they remain dirty for the next flush. This
 prevents a continuous writer from making flush run forever.
+
+The batch size is adaptive. It starts at the smaller of the configured window
+and the store's worst-case log headroom, doubles the window after sustained good
+throughput, and probes smaller windows again after the window has been at its
+maximum for a while. Windows are rounded to the erase-block granularity
+(`128 KiB` by default), so a configured range of `128 KiB..4 MiB` produces
+whole erase-block groups. The observed cost includes the batch write and its
+`fsync`, so the tuner follows the durability path rather than only the transfer
+call. Coalescing never exceeds the log headroom reserved for one incompressible
+batch; older stores with tighter logs simply use a smaller window.
 
 For each batch:
 
@@ -201,6 +224,8 @@ Compaction runs when the append would exceed `log_bytes`, or when the user calls
    - all live records, rewritten with `epoch + 1`,
    - a new superblock at slot A with `head = new_head`,
    - zeroes in slot B.
+   With a direct backend, extend the sidecar with zeroes to a 4096-byte
+   boundary before the final `fsync`.
 5. `fsync` the sidecar.
 6. Close the old file handle (required on Windows before renaming).
 7. Rename `<store>` to `<store>.old`.
@@ -209,10 +234,10 @@ Compaction runs when the append would exceed `log_bytes`, or when the user calls
    generation, and delete `<store>.old`.
 
 Every live page is copied in the worst case, so the minimum log size includes
-one full logical capacity plus a full flush batch. The default log adds 25%
-headroom above the logical size to reduce compaction frequency; use
-`--log-size` to choose a different value. The sidecar requires enough free space
-for a second copy of the live set.
+one full logical capacity plus one flush batch (up to 1024 pages, but never more
+pages than the store has). The default log adds 25% headroom above the logical
+size to reduce compaction frequency; use `--log-size` to choose a different
+value. The sidecar requires enough free space for a second copy of the live set.
 
 ## 8. Recovery
 
@@ -314,7 +339,75 @@ immediately and become durable on the next flush. The server advertises
 multi-connection support because all connections share one store and a flush
 covers writes from every connection.
 
-## 11. Why this cannot beat DDR3
+## 11. I/O backends
+
+The engine talks to a private `Backend` trait with two operations:
+`read_exact_at` and `write_all_at`. The backend is chosen once, when the store
+is opened, and is never part of the on-disk format.
+
+| Requested mode | Platform | Mechanism | Fallback |
+| --- | --- | --- | --- |
+| `portable` (default) | all | buffered positioned reads and writes | none needed |
+| `direct` | Linux / Android | `O_DIRECT` | portable if the open is rejected |
+| `direct` | Windows | `FILE_FLAG_NO_BUFFERING` | portable if the open is rejected |
+| `direct` | macOS | `F_NOCACHE` | portable if the open is rejected |
+| `uring` | Linux | io_uring with a registered fixed buffer and optional `IORING_SETUP_SQPOLL` | portable if ring creation, buffer registration, or the direct open fails |
+| `iocp` | Windows | overlapped I/O completed through an I/O completion port | portable if the port cannot be created |
+
+Records are only 8-byte aligned, while direct I/O requires sector-aligned
+offsets, lengths, and buffers. The direct and asynchronous backends therefore
+bounce every unaligned span through a 4 KiB-aligned transfer buffer. A write
+that covers only part of a sector reads the existing first and last sectors
+first, overlays the payload, zero-fills any bytes beyond the current end of
+file, and writes whole sectors. The store reports the mode that is actually in
+use (`io_mode`, `io_direct`, `io_sqpoll`); a requested mode that could not be
+initialized is never reported as active.
+
+The io_uring backend registers one buffer of roughly 4 MiB and submits one
+operation at a time while holding a mutex. This keeps the implementation
+synchronous and the completion ordering simple. Queue-depth scaling in the
+benchmark comes from concurrent caller threads, not from an internal
+submission queue. `SQPOLL` is requested when the kernel allows it; otherwise
+the ring falls back to ordinary `io_uring_enter` submissions. The IOCP backend
+opens the file for overlapped I/O, associates the handle with a completion
+port, and waits for each completion before returning.
+
+## 12. Memory and hugepages
+
+By default every cache page and transfer buffer is a boxed
+`#[repr(C, align(4096))]` array. The default build uses no unsafe code.
+
+With the `hugepages` feature, an opt-in arena carves 4 KiB pages out of 2 MiB
+chunks. Linux uses `mmap(..., MAP_HUGETLB | MAP_HUGE_2MB)`; Windows uses
+`VirtualAlloc(..., MEM_LARGE_PAGES)`. If the operating system has no reserved
+large pages, or the process lacks the required privilege, the arena allocates an
+ordinary anonymous mapping instead and reports that no huge chunk is active.
+Transfer buffers come from the same allocator and are rounded up to a whole
+chunk. Every page remains 4 KiB aligned either way, so the sector-alignment
+contract is unchanged.
+
+Cache pages are shared `Arc<AlignedPage>` handles. Flush and eviction take an
+independent `copy()` snapshot, so payload compression never holds a shard lock
+and a concurrent writer cannot mutate a snapshot. A handle can only be mutated
+when it is unique.
+
+## 13. Unsafe code and validation
+
+The default feature set compiles with `#![forbid(unsafe_code)]`. Optional
+features enable the platform modules that need FFI: aligned allocation and
+hugepage mappings in `mem.rs`, direct-open flags, the io_uring backend, the IOCP
+backend, and the macOS `F_NOCACHE` call. Each `unsafe` block has a safety
+comment, and the engine only sees the safe `Io` wrapper.
+
+CI validates the feature matrix on Linux, Windows, and macOS, runs Clippy with
+`-D warnings`, checks the MSRV, runs Miri over the default-feature library tests,
+and runs AddressSanitizer over the store integration tests. Hardware smoke jobs
+run `init`, `info`, and `verify` with `--io direct`, `--io uring`, and
+`--io iocp`. GitHub-hosted runners do not guarantee reserved hugepages or
+privileged SQPOLL, so those jobs accept a clean fallback as a valid result and
+check that the reported effective mode is coherent.
+
+## 14. Why this cannot beat DDR3
 
 A DDR3 module moves data at tens of gigabytes per second with nanosecond-scale
 latency. USB 3.x delivers a serial link with protocol overhead, and NAND flash

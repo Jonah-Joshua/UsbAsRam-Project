@@ -27,6 +27,15 @@ working, testable, cross-platform storage engine rather than a kernel stub.
 - **4 KiB paged block device** with a simple, documented on-disk format.
 - **Sharded CLOCK page cache** with cache-line-padded read/write locks,
   4 KiB-aligned page buffers, and per-shard buffer recycling.
+- **Optional accelerated I/O**: portable buffered I/O by default, plus
+  `O_DIRECT`/`FILE_FLAG_NO_BUFFERING`/`F_NOCACHE` direct I/O, Linux io_uring
+  with a registered fixed buffer and optional SQPOLL, and Windows IOCP. Every
+  optional path falls back cleanly and reports the effective mode.
+- **Opt-in hugepages** for cache pages and transfer buffers, using
+  `MAP_HUGETLB` on Linux and `MEM_LARGE_PAGES` on Windows when available.
+- **Adaptive write coalescing** that groups sequential flushes into
+  erase-block-friendly windows from 128 KiB to 4 MiB and adjusts the window
+  from observed write-plus-fsync latency.
 - **Thread-per-core NBD pipeline**: each connection has a reader that feeds a
   bounded MPMC queue; a shared worker pool executes READ, WRITE, and TRIM in
   parallel, with replies serialized per connection. FLUSH and FUA act as ordered
@@ -44,8 +53,8 @@ working, testable, cross-platform storage engine rather than a kernel stub.
   `WRITE_ZEROES`, and multi-connection support.
 - **CLI** for creating, inspecting, verifying, compacting, benchmarking, and
   serving stores.
-- **CI on Linux, Windows, and macOS**, including tests, Clippy, MSRV, release
-  builds, and a benchmark artifact.
+- **CI on Linux, Windows, and macOS**, including tests, Clippy, MSRV, feature
+  matrices, Miri, AddressSanitizer, release builds, and benchmark artifacts.
 
 ## Quick start
 
@@ -53,6 +62,13 @@ Build from source (Rust 1.85 or newer):
 
 ```bash
 cargo build --release
+```
+
+The default build is portable and contains no unsafe code. To include the
+optional direct-I/O, io_uring, IOCP, and hugepage backends in the binary:
+
+```bash
+cargo build --release --features hardware
 ```
 
 Create a 64 MiB store with the default 64 MiB hot cache:
@@ -103,6 +119,36 @@ Machine-readable output for CI:
 ./target/release/usbasram bench --quick --json
 ```
 
+### I/O engines and memory
+
+Every command that opens a store accepts the same engine flags:
+
+```bash
+# Portable buffered I/O (default).
+./target/release/usbasram info ./usb-store.usr
+
+# Sector-aligned direct I/O. The store file is padded to a sector boundary.
+./target/release/usbasram info ./usb-store.usr --io direct
+
+# Linux io_uring with SQPOLL when the kernel permits it.
+./target/release/usbasram serve ./usb-store.usr --io uring
+
+# Windows overlapped I/O through an I/O completion port.
+./target/release/usbasram info ./usb-store.usr --io iocp
+
+# Try large pages for the hot cache and transfer buffers.
+./target/release/usbasram info ./usb-store.usr --io direct --hugepages
+
+# Disable or retune the adaptive coalescer.
+./target/release/usbasram serve ./usb-store.usr --no-coalesce
+./target/release/usbasram serve ./usb-store.usr \
+  --coalesce-min 128K --coalesce-max 4M --erase-block 128K
+```
+
+A mode that cannot be initialized on the current platform or filesystem falls
+back to portable I/O. `info` prints the effective engine, whether direct mode
+and SQPOLL are active, and whether hugepages are in use.
+
 ## Commands
 
 | Command | Purpose |
@@ -112,7 +158,7 @@ Machine-readable output for CI:
 | `serve <path>` | Serve the store over NBD. Use `--size` to create it if missing. |
 | `verify <path>` | Scan every live cold record, verify CRC32C, and decompress it. |
 | `compact <path>` | Flush and rewrite the log so it contains only live pages. |
-| `bench` | Measure hot reads, hot writes, and cold reads. |
+| `bench` | Measure hot reads/writes at several queue depths, tail latency, cold reads, and raw backend throughput. |
 
 Sizes accept `4096`, `64K`, `64KiB`, `1M`, `2GiB`, `1.5T`, and similar forms.
 
@@ -159,19 +205,33 @@ concurrency rules.
   decompression. Uncompressed records are read directly into the aligned cache
   page, with no intermediate userspace buffer. The USB device is the bottleneck.
 - **Flushes** compress and checksum pages in parallel, then issue one positioned
-  write for the whole batch, fsync the data, and fsync the commit superblock.
-  This is the best access pattern for flash.
+  write for an adaptive 128 KiB–4 MiB window, fsync the data, and fsync the
+  commit superblock. This is the best access pattern for flash, and the window
+  tunes itself from the measured write-plus-fsync cost.
+- **Direct I/O** bypasses the OS page cache on the backing file. Because log
+  records are only 8-byte aligned, the backend bounces unaligned spans through
+  a sector-aligned buffer and performs read-modify-write on partial head and
+  tail sectors.
+- **io_uring and IOCP** keep the same positioned-I/O contract behind the same
+  engine. They are selected at store open; if the platform, kernel, privileges,
+  or filesystem reject the setup, the store continues on portable I/O and
+  reports that fact.
+- **Hugepages** reduce TLB pressure for the hot cache and transfer buffers when
+  the operating system has reserved large pages. The store works identically
+  without them.
 - **Compression** reduces bytes written to USB for compressible data. Text,
   zero-filled pages, and sparse files benefit the most; already-compressed data
   is stored raw when LZ4 would expand it.
 - **Compaction** costs one rewrite of the live set. Size the log to avoid
   frequent compactions, or call `compact` during maintenance windows.
-- **Latency**: `bench` reports hot-read p50/p99 latency alongside throughput.
+- **Latency**: `bench` reports hot-read and cold-read p50/p99/p99.9 latency
+  alongside queue-depth throughput.
 
 `usbasram` is not a replacement for physical RAM. It is a durable, portable,
 crash-safe tier that keeps the hot set in RAM and pushes the cold set to USB.
 The data path is a userspace thread-per-core engine with batched positioned
-I/O; it does not require kernel-bypass or a special block driver.
+I/O. Accelerated backends remain optional; the portable path is the reference
+implementation and the fallback.
 
 ## Durability model
 
@@ -191,15 +251,20 @@ All builds and tests run in GitHub Actions. The workflow runs:
 - formatting and Clippy,
 - the test suite on Linux, Windows, and macOS,
 - a minimum-supported-Rust check,
+- feature-matrix checks for direct I/O, hugepages, io_uring, IOCP, and all
+  features,
+- Miri over the default-feature library tests and AddressSanitizer over the
+  store integration tests,
+- hardware smoke tests that exercise `--io direct`, `--io uring`, and
+  `--io iocp` with a clean fallback as a valid outcome,
 - release builds,
-- a benchmark whose JSON output is uploaded as a build artifact.
-
-Local commands, if you have a Rust toolchain:
+- benchmarks whose JSON output is uploaded as a build artifact.
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets
+cargo test -p usbasram-core --features hardware --test store
 cargo build --workspace --release
 ```
 
@@ -221,15 +286,25 @@ crates/usbasram-cli    command-line interface and benchmark
 - `TRIM` and `WRITE_ZEROES` zero pages. They do not issue ATA/SCSI discard
   commands to the USB device.
 - Compaction temporarily needs space for a second copy of the live set.
-- The data path uses portable positioned reads and writes. It does not yet issue
-  `io_uring` on Linux or IOCP on Windows, and the cache is not hugepage-backed.
+- Direct I/O requires a filesystem that supports aligned direct access. If the
+  open is rejected, the store falls back to portable I/O and says so.
+- io_uring may be disabled by a container seccomp policy or an old kernel.
+  SQPOLL additionally depends on kernel version and privileges. A failed setup
+  is not fatal.
+- Hugepages require pre-reserved pages on Linux and `SeLockMemoryPrivilege` on
+  Windows. Without them the store falls back to ordinary 4 KiB pages.
+- The io_uring and IOCP backends submit one operation at a time per store;
+  concurrency comes from caller threads. They are not a multi-queue block
+  driver.
+- The benchmark's raw phases measure the backend directly and do not include
+  the store's record format, compression, or recovery logic.
 
 ## Roadmap
 
-- Batch block I/O through `io_uring` on Linux and IOCP on Windows behind the
-  current `Store` interface.
-- Optional hugepage-backed cache allocation and direct-I/O alignment.
+- Batch and pipeline io_uring/IOCP requests across caller threads while keeping
+  the portable contract and fallback behavior.
 - Queue-depth and worker-count tuning guidance for NBD clients.
+- Optional device-level discard passthrough for `TRIM`.
 
 ## License
 

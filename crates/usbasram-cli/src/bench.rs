@@ -87,8 +87,8 @@ pub fn run(options: BenchOptions) -> Result<()> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("bench.usr");
     let mut phases = Vec::new();
-    let mut hot_latency = Latency::empty();
-    let mut cold_latency = Latency::empty();
+    let hot_latency;
+    let cold_latency;
     let (effective_mode, effective_direct, effective_sqpoll, effective_hugepages);
 
     {
@@ -155,7 +155,7 @@ pub fn run(options: BenchOptions) -> Result<()> {
         cold_latency = read_latency(&store, pages, 20_000);
     }
 
-    let raw_bytes = (options.size_bytes.min(64 * 1024 * 1024)).max(4 * 1024 * 1024);
+    let raw_bytes = options.size_bytes.clamp(4 * 1024 * 1024, 64 * 1024 * 1024);
     let raw_path = directory.path().join("raw.bin");
     let raw_report = raw::run(&raw_path, options.io_mode, raw_bytes, options.hugepages)?;
     phases.push(Phase {

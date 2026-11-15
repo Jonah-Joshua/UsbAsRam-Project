@@ -724,7 +724,9 @@ mod iocp {
                     .state
                     .lock()
                     .map_err(|_| io::Error::other("IOCP state poisoned"))?;
-                associate(state.port, handle)?;
+                associate(state.port, handle).map_err(|error| {
+                    io::Error::new(error.kind(), format!("IOCP associate: {error}"))
+                })?;
                 let pointer = state.buffer.as_mut_ptr();
                 overlapped_io(state.port, handle, pointer, span, base, true)?;
                 let source = &state.buffer.as_slice()[head..head + chunk];
@@ -752,7 +754,9 @@ mod iocp {
                     .state
                     .lock()
                     .map_err(|_| io::Error::other("IOCP state poisoned"))?;
-                associate(state.port, handle)?;
+                associate(state.port, handle).map_err(|error| {
+                    io::Error::new(error.kind(), format!("IOCP associate: {error}"))
+                })?;
                 let pointer = state.buffer.as_mut_ptr();
                 state.buffer.as_mut_slice()[..span].fill(0);
                 if head != 0 || aligned_end > end {
@@ -808,6 +812,7 @@ mod iocp {
             overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
         }
         let mut transferred = 0u32;
+        let operation = if read { "read" } else { "write" };
         // SAFETY: `pointer` points to `len` bytes in the backend's registered
         // buffer, and `overlapped` lives until the completion is reaped. The
         // raw pointer is cast to the `c_void` element type expected by Win32.
@@ -833,10 +838,18 @@ mod iocp {
         if started == 0 {
             let error = io::Error::last_os_error();
             if error.raw_os_error() != Some(ERROR_IO_PENDING as i32) {
-                return Err(error);
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("IOCP {operation} at offset {offset} ({len} bytes): {error}"),
+                ));
             }
         }
-        wait(port, &mut overlapped, len)
+        wait(port, &mut overlapped, len).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("IOCP {operation} at offset {offset} ({len} bytes): {error}"),
+            )
+        })
     }
 
     fn wait(port: HANDLE, overlapped: &mut OVERLAPPED, expected: usize) -> io::Result<()> {
