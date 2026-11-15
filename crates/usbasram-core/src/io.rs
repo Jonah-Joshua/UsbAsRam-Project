@@ -666,7 +666,8 @@ mod iocp {
     use std::sync::Mutex;
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+        CloseHandle, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, GetHandleInformation, HANDLE,
+        INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
     use windows_sys::Win32::System::IO::{
@@ -797,9 +798,32 @@ mod iocp {
     fn associate(port: HANDLE, handle: HANDLE) -> io::Result<()> {
         // SAFETY: both handles are live; re-associating an already associated
         // file returns the existing port and is harmless.
+        let mut info = 0u32;
+        // SAFETY: both handles are live kernel handles owned by this backend.
+        let port_ok = unsafe { GetHandleInformation(port, &mut info) };
+        // SAFETY: `handle` is the live file handle passed by the caller.
+        let file_ok = unsafe { GetHandleInformation(handle, &mut info) };
+        eprintln!(
+            "DBG associate port={port:?} file={handle:?} port_ok={port_ok} file_ok={file_ok}"
+        );
         let result = unsafe { CreateIoCompletionPort(handle, port, 0, 0) };
         if result.is_null() {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            // SAFETY: creates a fresh, unassociated port for diagnostics.
+            let fresh =
+                unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, ptr::null_mut(), 0, 0) };
+            // SAFETY: both handles are live for the duration of the call.
+            let retry = unsafe { CreateIoCompletionPort(handle, fresh, 0, 0) };
+            let retry_error = io::Error::last_os_error();
+            eprintln!(
+                "DBG retry fresh={fresh:?} retry_null={} retry_error={retry_error:?}",
+                retry.is_null()
+            );
+            // SAFETY: `fresh` is owned by this block.
+            unsafe {
+                CloseHandle(fresh);
+            }
+            return Err(error);
         }
         Ok(())
     }
@@ -845,6 +869,7 @@ mod iocp {
         if handle == INVALID_HANDLE_VALUE {
             return Err(io::Error::last_os_error());
         }
+        eprintln!("DBG iocp open {} handle={handle:?}", path.display());
         // SAFETY: `CreateFileW` returned a fresh handle owned by this function.
         Ok(unsafe { File::from_raw_handle(handle) })
     }
