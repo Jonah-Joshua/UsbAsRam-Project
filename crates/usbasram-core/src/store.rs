@@ -1102,7 +1102,7 @@ impl Store {
             pages
                 .par_iter()
                 .map(|(page_no, data, generation)| {
-                    encode_page(*page_no, *data, *generation, self.compress)
+                    encode_page(*page_no, data, *generation, self.compress)
                 })
                 .collect::<Vec<Result<EncodedPage>>>()
                 .into_iter()
@@ -1111,7 +1111,7 @@ impl Store {
             pages
                 .iter()
                 .map(|(page_no, data, generation)| {
-                    encode_page(*page_no, *data, *generation, self.compress)
+                    encode_page(*page_no, data, *generation, self.compress)
                 })
                 .collect::<Result<Vec<_>>>()?
         };
